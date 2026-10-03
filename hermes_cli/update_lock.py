@@ -1329,6 +1329,11 @@ def update_tree_job() -> int:
     return job
 
 
+def holds_checkout_lock(install_root: Path | str | None = None) -> bool:
+    """True when this process holds (or joined) the checkout lock: it IS the running update."""
+    return _HELD is not None and os.path.realpath(_HELD["path"]) == os.path.realpath(checkout_lock_path(install_root))
+
+
 def update_in_progress(install_root: Path | str | None = None) -> bool:
     """True while an update owns this install: a LIVE marker or a held checkout lock."""
     return read_live_update(install_root=install_root) is not None or checkout_lock_held(install_root)
@@ -1340,9 +1345,9 @@ def checkout_lock_held(install_root: Path | str | None = None) -> bool:
     A probe takes the lock for the microseconds of one try and drops it (closing the fd), the
     way ``marker.sh::checkout_lock_held`` does; an updater acquiring at that instant waits
     :data:`CHECKOUT_CONTENTION_WAIT_SECONDS` instead of failing (R6/D17)."""
-    path = checkout_lock_path(install_root)
-    if _HELD is not None and _HELD["path"] == str(path):
+    if holds_checkout_lock(install_root):
         return True
+    path = checkout_lock_path(install_root)
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except OSError:
