@@ -305,6 +305,10 @@ def _finish(request: dict, result_path: Path) -> int:
         reason = f"{type(exc).__name__}: {exc}"
         print(f"✗ Source update completion failed: {reason}")
     finally:
+        custody = sys.modules.get("hermes_cli.update_custody")
+        refusal = custody.refusal_notice() if code and custody is not None else None
+        if refusal:  # m2: what stopped it, whatever error the refusal turned into downstream
+            print(refusal)
         if code and request["gateway_mode"]:
             from hermes_cli.update_cmd import _write_gateway_update_exit_code
             _write_gateway_update_exit_code(False)
