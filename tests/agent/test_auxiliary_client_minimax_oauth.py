@@ -63,7 +63,7 @@ def test_resolve_minimax_oauth_builds_anthropic_wrapper_with_oauth_semantics():
     assert client is not None, (
         "minimax-oauth must produce a configured client when credentials are "
         "present, but the resolver returned (None, None). The oauth_minimax "
-        "arm in _resolve_registry_branch is missing."
+        "arm in the registry auth-type dispatch table is missing."
     )
     assert isinstance(client, AnthropicAuxiliaryClient), (
         f"minimax-oauth must build an AnthropicAuxiliaryClient (the inference "

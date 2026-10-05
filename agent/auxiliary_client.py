@@ -5397,58 +5397,21 @@ def _resolve_registry_branch(req: _ResolveRequest) -> _ResolveResult:
         return _resolve_api_key_branch(req, pconfig, resolve_api_key_provider_credentials)
     if auth_type == "external_process":
         return _resolve_external_process_branch(req, resolve_external_process_provider_credentials(provider))
-    if auth_type == "vertex":
-        client, final_model = _build_vertex_client(provider, req.model)
-    elif auth_type == "aws_sdk":
-        client, final_model = _build_bedrock_client(provider, req.model, raw_codex=req.raw_codex)
-    elif auth_type == "oauth_minimax":
-        # MiniMax OAuth → Anthropic-compatible inference endpoint with a callable bearer
-        # (tokens live ~15 min; the Anthropic SDK re-invokes the provider each request).
-        try:
-            from agent.anthropic_adapter import build_anthropic_client
-            from agent.anthropic_credentials import anthropic_route_is_oauth
-            from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
-        except ImportError:
-            return None, None
-        try:
-            credentials = resolve_minimax_oauth_runtime_credentials(as_token_provider=True)
-        except Exception as exc:
-            logger.warning(
-                "resolve_provider_client: minimax-oauth runtime resolution failed: %s", exc)
-            return None, None
-        token_provider = credentials.get("api_key")
-        base_url = str(credentials.get("base_url") or "").strip().rstrip("/")
-        if not callable(token_provider) or not base_url:
-            return None, None
-        final_model = _normalize_resolved_model(
-            req.model or _get_aux_model_for_provider(provider) or "MiniMax-M3", provider,
-        )
-        if _aux_probe_active():
-            return _AuxProbeClientStub(api_key="", base_url=base_url), final_model
-        try:
-            real_client = build_anthropic_client(token_provider, base_url)
-        except ImportError:
-            return None, None
-        # OAuth identity only for native api.anthropic.com routes (#114967): MiniMax is a
-        # third-party Anthropic-protocol host, so no Claude Code tool-name wire
-        # transforms / identity rewrites / response prefix stripping here.
-        client = AnthropicAuxiliaryClient(
-            real_client, final_model, token_provider, base_url,
-            is_oauth=anthropic_route_is_oauth(base_url, token_provider))
-        return _route_client(req, client, final_model)
-    elif auth_type in {"oauth_device_code", "oauth_external"}:
+    from agent.auxiliary_client_registry import REGISTRY_AUTHTYPE_ARMS
+    arm = REGISTRY_AUTHTYPE_ARMS.get(auth_type)
+    if arm is not None:
+        return arm(req)
+    if auth_type in {"oauth_device_code", "oauth_external"}:
         # nous / openai-codex / xai-oauth already returned from their explicit branches.
         _log_once_debug(_LOGGED_UNSUPPORTED_OAUTH_KEYS, provider,
                         "resolve_provider_client: OAuth provider %s not "
                         "directly supported, try 'auto'", provider)
         return None, None
-    else:
-        # The first occurrence surfaces a real schema-drift bug; per-call retries stay silent.
-        _log_once_debug(_LOGGED_UNHANDLED_AUTHTYPE_KEYS, (auth_type, provider),
-                        "resolve_provider_client: unhandled auth_type %s for %s",
-                        auth_type, provider)
-        return None, None
-    return _route_client(req, client, final_model) if client is not None else (None, None)
+    # The first occurrence surfaces a real schema-drift bug; per-call retries stay silent.
+    _log_once_debug(_LOGGED_UNHANDLED_AUTHTYPE_KEYS, (auth_type, provider),
+                    "resolve_provider_client: unhandled auth_type %s for %s",
+                    auth_type, provider)
+    return None, None
 
 
 # Explicit providers with a dedicated branch; anything else falls through to named custom
