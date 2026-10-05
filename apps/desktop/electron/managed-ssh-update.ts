@@ -15,6 +15,7 @@
  */
 
 import { expandRemotePath, shq } from './remote-lifecycle'
+import { REMOTE_MARKER_JUDGE_PY } from './remote-update-marker-programs'
 import { encodedPowerShell, powerShellCommand, psLiteral } from './windows-remote-lifecycle'
 
 const UPDATE_EXIT_INDEPENDENT_HANDOFF = 75
@@ -321,6 +322,7 @@ function buildWindowsManagedUpdateLaunch(target: RemoteUpdateTarget, correlation
 const OBSERVATION_SCRIPT = String.raw`
 import ctypes,json,os,re,sys
 from pathlib import Path
+${REMOTE_MARKER_JUDGE_PY}
 
 home=Path(os.path.expanduser(sys.argv[1]))
 correlation=sys.argv[2]
@@ -334,7 +336,6 @@ marker_path=install_root/'.hermes-update-in-progress'
 status_path=home/('.update_exit_code.'+correlation)
 ready_path=home/('.update_coordinator_ready.'+correlation)
 intent_path=home/('.update_launch_intent.'+correlation)
-marker_re=re.compile(rb'([1-9][0-9]*)\r?\n([0-9]+)(?:\r?\n)?\Z')
 
 def pid_alive(pid):
     if os.name!='nt':
@@ -397,15 +398,10 @@ def marker_state():
     try:raw=marker_path.read_bytes()
     except FileNotFoundError:return {'state':'absent'}
     except OSError:return {'state':'unavailable'}
-    match=marker_re.fullmatch(raw)
-    if not match:return {'state':'malformed'}
-    try:
-        pid=int(match.group(1));lease=int(match.group(2))
-        if pid<1 or pid>4294967295 or lease>9007199254740991:raise ValueError()
-    except ValueError:return {'state':'malformed'}
-    live=pid_alive(pid)
-    if live is None:return {'state':'unavailable','pid':pid}
-    return {'state':'live' if live else 'dead','pid':pid}
+    verdict=marker_verdict(raw)
+    if verdict=='UNCERTAIN':return {'state':'malformed'}
+    if verdict=='CLEAR':return {'state':'dead'}
+    return {'state':'live','pid':int(verdict[5:])}
 
 def terminal_code():
     try:raw=status_path.read_bytes()

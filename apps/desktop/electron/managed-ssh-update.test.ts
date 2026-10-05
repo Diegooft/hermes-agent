@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback } from 'node:child_process'
+import { exec as execCallback, spawn } from 'node:child_process'
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -513,9 +513,22 @@ test.runIf(process.platform !== 'win32')(
     const root = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-profile-marker-'))
     const profileHome = path.join(root, 'profiles', 'research')
 
+    // A v2 claim whose owner is gone and whose delegate is alive at its creation time.
+    const delegate = spawn('python3', ['-c', 'import time;print(time.time(),flush=True);time.sleep(30)'], {
+      stdio: ['ignore', 'pipe', 'inherit']
+    })
+
     try {
+      const ct = await new Promise<string>(resolve =>
+        delegate.stdout.once('data', chunk => resolve(String(chunk).trim()))
+      )
+
+      const now = Math.floor(Date.now() / 1000)
       await mkdir(profileHome, { recursive: true })
-      await writeFile(path.join(root, '.hermes-update-in-progress'), `${process.pid}\n1\n`)
+      await writeFile(
+        path.join(root, '.hermes-update-in-progress'),
+        `0\n${now}\nct:${ct}\ndelegate:${delegate.pid} ct:${ct}\nrun:desk-1\n`
+      )
 
       const command = buildRemoteUpdateObservationCommand(
         {
@@ -531,8 +544,9 @@ test.runIf(process.platform !== 'win32')(
       const parsed = parseRemoteUpdateObservation(stdout, CORRELATION)
 
       assert.equal(parsed.marker, 'live')
-      assert.equal(parsed.markerPid, process.pid)
+      assert.equal(parsed.markerPid, delegate.pid)
     } finally {
+      delegate.kill('SIGKILL')
       await rm(root, { force: true, recursive: true })
     }
   }
