@@ -58,23 +58,24 @@ def _unified(size_gb: int) -> HardwareBudget:
 #    24  | qwen3.8-27b             | (none fits)
 #    32  | qwen3.8-27b             | qwen3.6-35b-a3b
 #    48  | qwen3.8-27b             | qwen3.6-35b-a3b
-#    96  | qwen3.8-27b             | qwen3.6-35b-a3b
-#   128  | qwen3.8-flash-next      | qwen3.6-35b-a3b
+#    96  | qwen3.8-flash-next      | qwen3.8-flash-next
+#   128  | qwen3.8-flash-next      | qwen3.8-flash-next
 #   256  | qwen3.8-flash-next      | qwen3.8-flash-next
 #   512  | qwen3.8-flash-next      | qwen3.8-flash-next
 #
 # Reading guide for reviewers:
 # - Discrete <=16 GB: nothing runs resident; no automatic recommendation.
 #   Browse remains available for explicit spill choices.
-# - Discrete 24-96 GB: the 27B is the flagship experience — dense reads
+# - Discrete 24-48 GB: the 27B is the flagship experience — dense reads
 #   at ~1 TB/s clear the floor easily, so quality decides.
-# - Discrete/unified where Flash Next fits resident (128 GB discrete,
-#   256+ GB unified): the frontier model is the pick — highest quality,
-#   and its sparse decode clears the floor even at UMA bandwidth
-#   (~24 tok/s predicted at 210 GB/s).
-# - Unified 32-128 GB — the Spark class, the reason this resolver
-#   exists: the dense 27B predicts ~13 tok/s at UMA bandwidth (below
-#   the pleasant floor), so the 35B-A3B (~60 tok/s) wins.
+# - 96 GB and up, discrete or unified: Flash Next fits resident. Its
+#   IQ4_XS build loads ~60 GiB — the engine reads the 26.8 GiB per-layer
+#   embedding table from disk on demand — so with its MTP head and
+#   projector it needs ~74 GiB even at the native 256K window. It is the
+#   pick: highest quality, and its sparse decode clears the floor even at
+#   UMA bandwidth (~28 tok/s predicted at 210 GB/s).
+# - Unified 32-48 GB: the dense 27B predicts ~13 tok/s at UMA bandwidth
+#   (below the pleasant floor), so the 35B-A3B (~60 tok/s) wins.
 # - Unified <=24 GB: no entry passes the physics check inside the UMA
 #   budget (spilling is impossible on UMA by construction — the pool IS
 #   the RAM). The pane's browse flow is the path for those machines
@@ -90,10 +91,10 @@ DECISION_TABLE = [
     (32, "unified", "qwen3.6-35b-a3b", "speed-gated-quality"),
     (48, "discrete", "qwen3.8-27b", "best-quality-resident"),
     (48, "unified", "qwen3.6-35b-a3b", "speed-gated-quality"),
-    (96, "discrete", "qwen3.8-27b", "best-quality-resident"),
-    (96, "unified", "qwen3.6-35b-a3b", "speed-gated-quality"),
+    (96, "discrete", "qwen3.8-flash-next", "best-quality-resident"),
+    (96, "unified", "qwen3.8-flash-next", "best-quality-resident"),
     (128, "discrete", "qwen3.8-flash-next", "best-quality-resident"),
-    (128, "unified", "qwen3.6-35b-a3b", "speed-gated-quality"),
+    (128, "unified", "qwen3.8-flash-next", "best-quality-resident"),
     (256, "discrete", "qwen3.8-flash-next", "best-quality-resident"),
     (256, "unified", "qwen3.8-flash-next", "best-quality-resident"),
     (512, "discrete", "qwen3.8-flash-next", "best-quality-resident"),

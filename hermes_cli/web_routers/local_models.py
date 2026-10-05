@@ -407,20 +407,20 @@ def _model_id_for(gguf: Path) -> str:
 
 
 def _variant_files_on_disk(model_id: str) -> "list[Path]":
-    """Every local file of a staged model: all split parts plus catalog-declared assets (mmproj/draft) when present."""
+    """Every local file of a staged model: all split parts plus catalog-declared assets (mmproj/draft/MTP head) when present."""
     files = [p for p in bootstrap.models_dir().glob("*.gguf") if _model_id_for(p) == model_id]
     hit = catalog.find_entry_for_model(model_id)
-    assets = (hit[0].mmproj, hit[0].draft) if hit is not None else ()
+    assets = (hit[0].mmproj, hit[0].draft, hit[0].mtp_head) if hit is not None else ()
     files += [bootstrap.assets_dir() / a.local_name for a in assets
               if a is not None and (bootstrap.assets_dir() / a.local_name).exists()]
     return files
 
 
 def _download_plan(entry, variant) -> list:
-    """Everything a variant needs: split parts + mmproj/draft assets, as (url, dest, bytes) tuples."""
+    """Everything a variant needs: split parts + mmproj/draft/MTP head assets, as (url, dest, bytes) tuples."""
     plan = [(_hf_url(entry.repo, a.path), bootstrap.models_dir() / a.local_name, a.size_bytes) for a in variant.files]
     plan += [(_hf_url(entry.repo, a.path), bootstrap.assets_dir() / a.local_name, a.size_bytes)
-             for a in (entry.mmproj, entry.draft) if a is not None]
+             for a in (entry.mmproj, entry.draft, entry.mtp_head) if a is not None]
     return plan
 
 
@@ -574,7 +574,7 @@ def _catalog_row(entry, budget, recommended, recommended_reason, staged_ids) -> 
         "recommended": entry.id == recommended,
         "recommended_reason": recommended_reason if entry.id == recommended else None,
         "downloaded": dl is not None, "downloaded_model_id": dl.model_id if dl else None,
-        "downloaded_quant": dl.quant if dl else None, "mtp": entry.mtp, "vision": entry.mmproj is not None,
+        "downloaded_quant": dl.quant if dl else None, "mtp": entry.mtp_capable, "vision": entry.mmproj is not None,
         # Day-0 architectures need the llama.cpp release where their support landed: True gates
         # download/activate until the engine updates, but the row still renders (visible + explained beats hidden).
         "needs_engine": _engine_too_old(entry.min_engine),

@@ -57,6 +57,28 @@ def _asset_path(asset) -> "Path | None":
     return path if path.exists() else None
 
 
+@dataclass(frozen=True)
+class _Companions:
+    """The files a catalog entry loads beside its weights, as far as they are on disk."""
+
+    mmproj: "Path | None" = None
+    mtp_head: "Path | None" = None
+    nbytes: int = 0
+
+
+def _companions(entry) -> _Companions:
+    if entry is None:
+        return _Companions()
+    mmproj, head = _asset_path(entry.mmproj), _asset_path(entry.mtp_head)
+    nbytes = sum(a.size_bytes for a, p in ((entry.mmproj, mmproj), (entry.mtp_head, head)) if p)
+    return _Companions(mmproj=mmproj, mtp_head=head, nbytes=nbytes)
+
+
+def _runs_mtp(entry, companions: _Companions) -> bool:
+    """MTP spec decode runs for a catalog entry: built-in heads, or a shipped head on disk."""
+    return entry is not None and (entry.mtp or companions.mtp_head is not None)
+
+
 def _draft_fits(path: Path, profile, budget: HardwareBudget, window: int, overhead: int) -> bool:
     """Optional draft never shrinks the advertised window or displaces its GPU buffers.
 
@@ -95,11 +117,10 @@ def preset_for_model(gguf: Path, budget: HardwareBudget,
         logger.warning("preset skip %s: %s", gguf.name, exc)
         return None
     entry = entry_for_model(model_id)
-    is_mtp = entry.mtp if entry is not None else model_id in mtp_capable
+    companions = _companions(entry)
+    is_mtp = _runs_mtp(entry, companions) if entry is not None else model_id in mtp_capable
 
-    mmproj_path = _asset_path(entry.mmproj) if entry is not None else None
-    fixed_overhead = RUNTIME_OVERHEAD_BYTES + (
-        entry.mmproj.size_bytes if entry is not None and mmproj_path is not None else 0)
+    fixed_overhead = RUNTIME_OVERHEAD_BYTES + companions.nbytes
     plan = plan_launch(profile, budget, mtp_capable=is_mtp, fixed_overhead=fixed_overhead,
                        requested_window=(load_window_overrides().get(model_id)
                                          if requested_window is None else requested_window))
@@ -130,8 +151,11 @@ def preset_for_model(gguf: Path, budget: HardwareBudget,
     if entry is not None:
         for k, v in (entry.sampling or {}).items():
             keys.setdefault(k, v)
-        if mmproj_path is not None:
-            keys["mmproj"] = str(mmproj_path)
+        if companions.mmproj is not None:
+            keys["mmproj"] = str(companions.mmproj)
+        if companions.mtp_head is not None:
+            # The model carries no MTP layers: draft-mtp drafts from the shipped head instead.
+            keys["model-draft"] = str(companions.mtp_head)
         draft_path = _asset_path(entry.draft) if decision.spilled else None
         if draft_path is not None and _draft_fits(draft_path, profile, budget, decision.window, plan.overhead_bytes):
             keys["model-draft"] = str(draft_path)
@@ -153,10 +177,11 @@ def resident_footprint(gguf: Path, budget: HardwareBudget, window: int) -> int |
         logger.debug("footprint skip %s: %s", gguf.name, exc)
         return None
     entry = entry_for_model(model_id)
-    is_mtp = entry.mtp if entry is not None else False
-    mmproj = entry.mmproj.size_bytes if entry is not None and _asset_path(entry.mmproj) else 0
+    companions = _companions(entry)
+    is_mtp = _runs_mtp(entry, companions)
     plan = plan_launch(profile, budget, mtp_capable=is_mtp,
-                       fixed_overhead=RUNTIME_OVERHEAD_BYTES + mmproj, requested_window=window)
+                       fixed_overhead=RUNTIME_OVERHEAD_BYTES + companions.nbytes,
+                       requested_window=window)
     if is_mtp and profile.kv_scale == 1.0:
         profile = replace(profile, kv_scale=1.2)
     return footprint_bytes(profile, window, overhead_bytes=plan.overhead_bytes)
@@ -176,10 +201,9 @@ def _launch_footprint(gguf: Path, budget: HardwareBudget) -> int | None:
         logger.debug("footprint skip %s: %s", gguf.name, exc)
         return None
     entry = entry_for_model(model_id)
-    is_mtp = entry.mtp if entry is not None else False
-    mmproj = entry.mmproj.size_bytes if entry is not None and _asset_path(entry.mmproj) else 0
-    plan = plan_launch(profile, budget, mtp_capable=is_mtp,
-                       fixed_overhead=RUNTIME_OVERHEAD_BYTES + mmproj,
+    companions = _companions(entry)
+    plan = plan_launch(profile, budget, mtp_capable=_runs_mtp(entry, companions),
+                       fixed_overhead=RUNTIME_OVERHEAD_BYTES + companions.nbytes,
                        requested_window=load_window_overrides().get(model_id))
     if isinstance(plan.decision, PhysicsRefusal):
         return None

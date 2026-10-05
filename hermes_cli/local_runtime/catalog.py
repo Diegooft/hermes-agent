@@ -97,6 +97,9 @@ class CatalogEntry:
     n_vocab: int = 0
     mmproj: "AssetFile | None" = None    # vision projector, downloads with model
     draft: "AssetFile | None" = None     # spec-decode draft model (e.g. DSpark)
+    # MTP head shipped as its own file (the model carries none): the engine loads it as the
+    # draft for MTP spec decode. Downloads with the model.
+    mtp_head: "AssetFile | None" = None
     sampling: dict = field(default_factory=dict)  # INI long-form launch defaults
     # Oldest llama.cpp release tag that can load this model (day-0 architectures need the release
     # where their support landed). Empty means any installed engine.
@@ -111,6 +114,16 @@ class CatalogEntry:
     # recommendation.
     decode_fraction: float = 1.0
 
+    @property
+    def mtp_capable(self) -> bool:
+        """MTP spec decode runs, from heads built into the model or shipped beside it."""
+        return self.mtp or self.mtp_head is not None
+
+    @property
+    def companion_bytes(self) -> int:
+        """Companion files the engine loads beside the weights (vision projector, MTP head)."""
+        return sum(a.size_bytes for a in (self.mmproj, self.mtp_head) if a is not None)
+
     def profile(self, variant: QuantVariant) -> ModelProfile:
         layers = ([(LayerKind.FULL, self.per_layer_f16)] * self.full_layers
                   + [(LayerKind.SWA, self.per_layer_f16)] * self.swa_layers
@@ -118,17 +131,16 @@ class CatalogEntry:
         return ModelProfile(
             name=variant.model_id, weights_bytes=variant.weights_bytes, embd_table_bytes=0,
             n_ctx_train=self.n_ctx_train, layers=layers, swa_window=self.swa_window, moe=self.moe,
-            n_vocab=self.n_vocab, kv_scale=1.2 if self.mtp else 1.0)
+            n_vocab=self.n_vocab, kv_scale=1.2 if self.mtp_capable else 1.0)
 
     def launch_plan(self, variant: QuantVariant, budget: HardwareBudget) -> LaunchPlan:
         # Optional external drafts may use spare memory after download, never reduce this grant.
-        return plan_launch(self.profile(variant), budget, mtp_capable=self.mtp,
-                           fixed_overhead=RUNTIME_OVERHEAD_BYTES
-                           + (self.mmproj.size_bytes if self.mmproj else 0))
+        return plan_launch(self.profile(variant), budget, mtp_capable=self.mtp_capable,
+                           fixed_overhead=RUNTIME_OVERHEAD_BYTES + self.companion_bytes)
 
     def download_files(self, variant: QuantVariant) -> tuple:
         """Everything a download job fetches for this variant, in order."""
-        extras = tuple(a for a in (self.mmproj, self.draft) if a is not None)
+        extras = tuple(a for a in (self.mmproj, self.draft, self.mtp_head) if a is not None)
         return tuple(variant.files) + extras
 
     def download_bytes(self, variant: QuantVariant) -> int:
@@ -293,6 +305,7 @@ def _load_catalog(doc: dict) -> "tuple[CatalogEntry, ...]":
             id=m["id"], display_name=m["display_name"],
             description=m["description"], repo=m["repo"], variants=variants,
             mmproj=_asset_from(m.get("mmproj")), draft=_asset_from(m.get("draft")),
+            mtp_head=_asset_from(m.get("mtp_head")),
             **scalars))
     return tuple(entries)
 
