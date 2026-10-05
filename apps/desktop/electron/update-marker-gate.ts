@@ -39,7 +39,7 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 
-import { type CreateTimeProbe, inspectUpdateMarker, markerPath } from './update-marker'
+import { type CreateTimeProbe, inspectUpdateMarker, type MarkerInspection, markerPath } from './update-marker'
 import type { MarkerHelperVerdict } from './updater/marker-helper'
 
 export const HELD_REPROBE_MS = 5_000
@@ -270,6 +270,42 @@ function logOverrideOnce(entry: AskedEntry, state: HeldState, log: ((line: strin
   )
 }
 
+/** What the script helper is asked about: a dead marker body, or no marker at all. */
+interface HelperSubject {
+  holdId: string
+  absent: boolean
+  label: string
+  ownerPid: number | null
+  run: { startedAt: number | null; runId: string | null }
+}
+
+function helperSubject(inspection: MarkerInspection, hermesHome: string): HelperSubject | null {
+  if (inspection.state === 'absent') {
+    return { holdId: ABSENT_HOLD_ID, absent: true, label: 'no update marker', ownerPid: null, run: { startedAt: null, runId: null } }
+  }
+
+  if (inspection.state !== 'dead') {
+    return null
+  }
+
+  return {
+    holdId: markerHoldId(inspection.raw, statMarkerFile(hermesHome)),
+    absent: false,
+    label: 'dead update marker',
+    ownerPid: inspection.marker?.pid ?? null,
+    run: { startedAt: inspection.marker?.startedAt ?? null, runId: inspection.marker?.run ?? null }
+  }
+}
+
+/**
+ * No marker: only the helper's positive `held` (a process holds the checkout
+ * lock) closes the gate; a helper that cannot answer keeps the old "no
+ * marker, nothing runs" so a broken script never blocks boot.
+ */
+function keepsGateShut(verdict: MarkerHelperVerdict, absent: boolean): boolean {
+  return STILL_RUNNING.has(verdict.kind) && (!absent || verdict.kind === 'held')
+}
+
 /** `hasLiveMarker` for one gate wait (create it per wait, never module-wide). */
 export function liveMarkerProbe({
   hermesHome,
@@ -293,33 +329,30 @@ export function liveMarkerProbe({
       return true
     }
 
-    const absent = inspection.state === 'absent'
+    const subject = reclaim ? helperSubject(inspection, hermesHome) : null
 
-    if ((inspection.state !== 'dead' && !absent) || !reclaim) {
+    if (!subject || !reclaim) {
       return false
     }
 
-    const holdId = absent ? ABSENT_HOLD_ID : markerHoldId(inspection.raw, statMarkerFile(hermesHome))
+    const { holdId } = subject
     const previous = asked.get(holdId)
     let entry = previous!
 
     if (verdictDue(previous, now, reprobeMs)) {
-      entry = await refreshVerdict(previous, holdId, reclaim, now, log, absent ? 'no update marker' : undefined)
+      entry = await refreshVerdict(previous, holdId, reclaim, now, log, subject.label)
       asked.set(holdId, entry)
     }
 
     const { verdict } = entry
 
-    // No marker: only the helper's positive `held` (a process holds the
-    // checkout lock) closes the gate; a helper that cannot answer keeps the
-    // old "no marker, nothing runs" so a broken script never blocks boot.
-    if (!STILL_RUNNING.has(verdict.kind) || (absent && verdict.kind !== 'held')) {
+    if (!keepsGateShut(verdict, subject.absent)) {
       return false
     }
 
     const state: HeldState = {
       verdict: verdict.kind as HeldState['verdict'],
-      ownerPid: absent ? null : (inspection.marker?.pid ?? null),
+      ownerPid: subject.ownerPid,
       livePid: 'pid' in verdict ? verdict.pid : null,
       holdId,
       since: heldSince(holdId, now()),
@@ -335,7 +368,7 @@ export function liveMarkerProbe({
     }
 
     onHeld?.(state)
-    onLiveMarker?.(absent ? { startedAt: null, runId: null } : { startedAt: inspection.marker?.startedAt ?? null, runId: inspection.marker?.run ?? null })
+    onLiveMarker?.(subject.run)
 
     return true
   }
