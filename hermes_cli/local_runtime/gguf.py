@@ -184,7 +184,7 @@ class GGUFHeader:
         return self.head_dim_k
 
 
-def _split_parts(path: Path) -> "list[Path] | None":
+def split_parts(path: Path) -> "list[Path] | None":
     """Every on-disk part of the split ``path`` belongs to, first part first; None when ``path`` is
     not a split member or no other part is present.
 
@@ -203,7 +203,13 @@ def _split_parts(path: Path) -> "list[Path] | None":
 def _read_part(path: Path) -> GGUFHeader:
     """One file's own header: metadata and that file's tensor table."""
     def read(f, fmt: str):
-        return struct.unpack(fmt, f.read(struct.calcsize(fmt)))
+        # A header cut short raises ValueError, which every caller already treats as "skip this
+        # model"; struct.error would escape them and take the whole preset pass down.
+        size = struct.calcsize(fmt)
+        data = f.read(size)
+        if len(data) != size:
+            raise ValueError(f"truncated GGUF header: {path}")
+        return struct.unpack(fmt, data)
 
     def read_str(f) -> str:
         (n,) = read(f, "<Q")
@@ -265,13 +271,14 @@ def read_gguf_header(path: str | Path) -> GGUFHeader:
     part 1 alone underprices every model whose first shard is a metadata stub (the Hugging Face
     layout), which then makes the physics check and the residency cap admit giants the card cannot
     hold. Architecture metadata (block count, train context, the per-layer SWA pattern, vocab) is
-    taken from the first part, which is where GGUF writes it.
+    taken from the first part: gguf-split writes the model's metadata there only, and every later
+    part carries just its ``split.*`` keys.
 
     A part that has gone missing or become unreadable is skipped rather than fatal: a half-arrived
     split prices at what is actually on disk. Refusing it is ``staged_in(require_complete=True)``'s
     job — an incomplete split is never servable, it is only underpriced here."""
     path = Path(path)
-    parts = _split_parts(path)
+    parts = split_parts(path)
     if parts is None:
         return _read_part(path)
 
@@ -280,9 +287,7 @@ def read_gguf_header(path: str | Path) -> GGUFHeader:
     for part in parts[1:]:
         try:
             readable.append(_read_part(part))
-        except (ValueError, OSError, struct.error) as exc:
-            # struct.error is neither ValueError nor OSError, and it is what a header cut
-            # mid-stream actually raises. A part that cannot be parsed is priced out, not fatal.
+        except (ValueError, OSError) as exc:
             logger.debug("split part unreadable %s: %s", part.name, exc)
     if len(readable) == 1:
         return first

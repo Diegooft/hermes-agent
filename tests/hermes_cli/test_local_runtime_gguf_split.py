@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 import struct
 
+import pytest
+
 from hermes_cli.local_runtime.context_policy import spill_overrides
 from hermes_cli.local_runtime.estimator import profile_from_gguf
 from hermes_cli.local_runtime.gguf import read_gguf_header
@@ -52,13 +54,21 @@ ARCH = {
 }
 
 
+def _split_keys(no: int, count: int) -> dict:
+    """What gguf-split writes into every part after the first: its split keys and nothing else
+    (checked against a published Flash Next split: part 1 carries 67 keys, parts 2-3 carry 3)."""
+    return {"split.no": no, "split.count": count, "split.tensors.count": 0}
+
+
 def _split(tmp_path, stem: str, parts: list[dict], total: int | None = None):
-    """A split on disk: ``parts[i]`` is the metadata + tensor table of shard i+1."""
+    """A split on disk laid out as gguf-split writes it: ``parts[i]`` is the tensor table of shard
+    i+1, and only shard 1 carries the model's metadata unless a spec overrides it."""
     total = total or len(parts)
     written = []
     for i, spec in enumerate(parts, start=1):
         path = tmp_path / f"{stem}-{i:05d}-of-{total:05d}.gguf"
-        _write_gguf(path, spec.get("metadata", ARCH), spec.get("tensors", []))
+        default = ARCH if i == 1 else _split_keys(i - 1, total)
+        _write_gguf(path, spec.get("metadata", default), spec.get("tensors", []))
         written.append(path)
     return written
 
@@ -121,8 +131,8 @@ def test_ffn_blocks_spread_across_shards_still_place_spill(tmp_path):
                     (f"blk.{i}.ffn_up.weight", 256), (f"blk.{i}.ffn_down.weight", 240)]
     parts = _split(tmp_path, "hybrid-split", [
         {"metadata": hybrid, "tensors": tensors[:1]},
-        {"metadata": hybrid, "tensors": tensors[1:37]},   # blocks 0-8 (4 tensors each)
-        {"metadata": hybrid, "tensors": tensors[37:]},    # blocks 9-11
+        {"tensors": tensors[1:37]},   # blocks 0-8 (4 tensors each)
+        {"tensors": tensors[37:]},    # blocks 9-11
     ], total=3)
 
     profile = profile_from_gguf(read_gguf_header(parts[0]))
@@ -163,7 +173,8 @@ def test_residency_cap_prices_a_split_against_the_card(tmp_path, monkeypatch):
     mdir.mkdir()
     # A 48 GiB split laid out the reported way: part 1 a metadata stub, the weights in part 2.
     _write_gguf(mdir / "giant-00001-of-00002.gguf", ARCH, [])
-    _write_gguf(mdir / "giant-00002-of-00002.gguf", ARCH, [("blk.0.attn_q.weight", 48 * GIB // 4)])
+    _write_gguf(mdir / "giant-00002-of-00002.gguf", _split_keys(1, 2),
+                [("blk.0.attn_q.weight", 48 * GIB // 4)])
     # A 10 GB single-shard neighbour: a small second resident must stay possible.
     _write_gguf(mdir / "utility.gguf", ARCH, [("blk.0.attn_q.weight", 10 * GIB // 4)])
 
@@ -171,3 +182,24 @@ def test_residency_cap_prices_a_split_against_the_card(tmp_path, monkeypatch):
                             ram_available_bytes=64 * GIB)
 
     assert presets.admitted_residency_count(mdir, budget, 4) == 1
+
+
+def test_a_truncated_header_skips_the_model_instead_of_raising(tmp_path, monkeypatch):
+    """Every caller skips a model whose header raises ValueError or OSError. A header cut short
+    used to raise struct.error, which none of them catch, so one bad file took down the whole
+    preset pass instead of dropping out of it."""
+    from hermes_cli.local_runtime import presets
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    parts = _split(tmp_path, "cut-head", [
+        {"tensors": []},
+        {"tensors": [("blk.0.attn_q.weight", 16 << 20)]},
+    ])
+    parts[0].write_bytes(b"GGUF\x03\x00")
+    budget = HardwareBudget(usable_vram_bytes=64 * GIB, total_device_bytes=64 * GIB,
+                            ram_available_bytes=64 * GIB)
+
+    with pytest.raises(ValueError):
+        read_gguf_header(parts[0])
+    assert presets.resident_footprint(parts[0], budget, 8192) is None
