@@ -3904,6 +3904,7 @@
     "sharedMetrics.stripChoices.off",
     "sharedMetrics.stripChoices.share",
     "sharedMetrics.stripDetails",
+    "sharedMetrics.stripReaskBody",
     "sharedMetrics.unavailable",
     "sharedMetrics.whatIsCollected",
     "shell.appControls",
