@@ -144,6 +144,7 @@ export interface Translations {
   status: {
     actionFailed: string;
     actionFinished: string;
+    actionFinishedOwed: string;
     actions: string;
     agent: string;
     connected: string;
