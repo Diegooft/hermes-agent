@@ -51,6 +51,9 @@ class QuantVariant:
     quant: str                  # e.g. "UD-Q4_K_M"
     files: tuple                # AssetFile, first = the load target
     validated: bool = False     # proven end-to-end on real hardware
+    # Bytes of tensors the engine reads from the file on demand instead of loading (see
+    # gguf._LAZY_READ_TENSORS), taken from the build's tensor table at authoring time.
+    lazy_bytes: int = 0
 
     @property
     def model_id(self) -> str:
@@ -62,9 +65,10 @@ class QuantVariant:
 
     @property
     def weights_bytes(self) -> int:
-        """Pre-download weights estimate: GGUF bytes ≈ tensor bytes + a <2% header — slightly
-        conservative until profile_from_gguf reads the real table."""
-        return self.size_bytes
+        """Pre-download estimate of the weights the engine loads: GGUF bytes ≈ tensor bytes + a <2%
+        header, less the tensors it reads from disk on demand — slightly conservative until
+        profile_from_gguf reads the real table."""
+        return self.size_bytes - self.lazy_bytes
 
 
 @dataclass(frozen=True)
@@ -280,7 +284,8 @@ def _load_catalog(doc: dict) -> "tuple[CatalogEntry, ...]":
     entries = []
     for m in doc["models"]:
         variants = tuple(QuantVariant(quant=v["quant"], validated=bool(v.get("validated")),
-                                      files=tuple(_asset_from(f) for f in v["files"]))
+                                      files=tuple(_asset_from(f) for f in v["files"]),
+                                      lazy_bytes=int(v.get("lazy_bytes", 0)))
                          for v in m["variants"])
         scalars = {k: coerce(m[k] if default is None else m.get(k, default))
                    for k, (coerce, default) in _SCALAR_FIELDS.items()}

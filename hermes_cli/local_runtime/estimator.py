@@ -55,7 +55,7 @@ class ModelProfile:
     construct profiles directly."""
 
     name: str
-    weights_bytes: int
+    weights_bytes: int          # weights the engine loads; tensors it reads from disk on demand are not
     embd_table_bytes: int
     n_ctx_train: int
     layers: list[tuple[LayerKind, int]]   # (kind, kv_bytes_per_token_f16); SWA capped, recurrent ignored
@@ -135,7 +135,8 @@ def profile_from_gguf(header: GGUFHeader) -> ModelProfile:
         n_attn_seen += 1
 
     return ModelProfile(
-        name=header.path, weights_bytes=header.tensor_bytes, embd_table_bytes=header.embd_table_bytes,
+        name=header.path, weights_bytes=header.tensor_bytes - header.lazy_bytes,
+        embd_table_bytes=header.embd_table_bytes,
         n_ctx_train=header.n_ctx_train, layers=layers, swa_window=header.sliding_window,
         moe=header.expert_count > 0, architecture=header.architecture, n_vocab=header.n_vocab,
         ffn_block_bytes=dict(header.ffn_block_bytes))

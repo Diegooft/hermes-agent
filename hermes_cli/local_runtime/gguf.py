@@ -22,6 +22,17 @@ _PART_SUFFIX_RE = re.compile(r"-\d{5}-of-\d{5}$")
 # Same tensor selection as context_policy's per-block FFN -ot override.
 _FFN_WEIGHT = re.compile(r"blk\.(\d+)\.ffn_.*\.weight")
 
+# Tensors llama.cpp leaves in the file and reads row by row on demand instead of loading them
+# (create_tensor's TENSOR_READ_LAZY, marked per architecture in the engine's model code). Under the
+# engine's default --lazy-mode auto, only a marked tensor larger than 4 GiB is read this way;
+# a smaller one loads like any other weight.
+_LAZY_READ_TENSORS = {
+    "qwen4exp": frozenset({"per_layer_token_embd.weight"}),
+    "gemma4": frozenset({"per_layer_token_embd.weight"}),
+}
+_LAZY_READ_CANDIDATES = frozenset().union(*_LAZY_READ_TENSORS.values())
+_LAZY_READ_MIN_BYTES = 4 << 30
+
 
 def model_id_from_stem(stem: str) -> str:
     """Model id from a GGUF file stem (split-part suffix stripped)."""
@@ -66,12 +77,22 @@ class GGUFHeader:
     # block index -> bytes of that block's FFN weights (the tensors a `blk\.N\.ffn_.*\.weight`
     # -ot override moves), so spill placement can move only as many blocks as it needs.
     ffn_block_bytes: dict[int, int] = field(default_factory=dict)
+    # Sizes of the tensors some architecture reads lazily, by name. ``lazy_bytes`` applies this
+    # model's architecture and the size threshold.
+    lazy_candidate_bytes: dict[str, int] = field(default_factory=dict)
 
     # ── typed accessors ──────────────────────────────────────
 
     @property
     def architecture(self) -> str:
         return str(self.metadata.get("general.architecture", ""))
+
+    @property
+    def lazy_bytes(self) -> int:
+        """Bytes of weights llama.cpp keeps on disk and reads row by row instead of loading."""
+        marked = _LAZY_READ_TENSORS.get(self.architecture, frozenset())
+        return sum(nbytes for name, nbytes in self.lazy_candidate_bytes.items()
+                   if name in marked and nbytes > _LAZY_READ_MIN_BYTES)
 
     def _arch_key(self, suffix: str):
         return self.metadata.get(f"{self.architecture}.{suffix}")
@@ -237,6 +258,7 @@ def _read_part(path: Path) -> GGUFHeader:
         tensor_bytes = 0
         embd_bytes = 0
         ffn_block_bytes: dict[int, int] = {}
+        lazy_candidate_bytes: dict[str, int] = {}
         for _ in range(n_tensors):
             name = read_str(f)
             (n_dims,) = read(f, "<I")
@@ -257,10 +279,13 @@ def _read_part(path: Path) -> GGUFHeader:
             elif m := _FFN_WEIGHT.match(name):
                 block = int(m.group(1))
                 ffn_block_bytes[block] = ffn_block_bytes.get(block, 0) + nbytes
+            elif name in _LAZY_READ_CANDIDATES:
+                lazy_candidate_bytes[name] = nbytes
 
     return GGUFHeader(path=str(path), version=version, metadata=metadata,
                       n_tensors=n_tensors, tensor_bytes=tensor_bytes,
-                      embd_table_bytes=embd_bytes, ffn_block_bytes=ffn_block_bytes)
+                      embd_table_bytes=embd_bytes, ffn_block_bytes=ffn_block_bytes,
+                      lazy_candidate_bytes=lazy_candidate_bytes)
 
 
 def read_gguf_header(path: str | Path) -> GGUFHeader:
@@ -303,4 +328,6 @@ def read_gguf_header(path: str | Path) -> GGUFHeader:
         n_tensors=sum(h.n_tensors for h in readable),
         tensor_bytes=sum(h.tensor_bytes for h in readable),
         embd_table_bytes=sum(h.embd_table_bytes for h in readable),
-        ffn_block_bytes=ffn_block_bytes)
+        ffn_block_bytes=ffn_block_bytes,
+        lazy_candidate_bytes={name: nbytes for h in readable
+                              for name, nbytes in h.lazy_candidate_bytes.items()})
