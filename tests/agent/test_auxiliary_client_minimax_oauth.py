@@ -18,11 +18,18 @@ bearer mints a fresh access token per outbound request because MiniMax's tokens 
 MiniMax host is a third-party Anthropic-protocol endpoint, so the wrapper must NOT carry
 the Claude Code OAuth identity (mcp__ tool-name wire transforms, system-prompt rewrites,
 response prefix stripping) — those are native api.anthropic.com-only (#114967).
+The arm lives in ``agent/auxiliary_client_registry.py`` (one new module, not a
+trampoline into a second sibling); absent/not-logged-in credentials follow the
+``_log_once_debug`` contract (``test_auxiliary_client_resolve_dedup.py``) so a logged-out
+user gets one debug line, not a WARNING-with-traceback per aux resolution (#21521).
 """
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from hermes_cli.auth_constants import AuthError
 
 INFERENCE_BASE_URL = "https://api.minimax.io/anthropic"
 
@@ -37,7 +44,7 @@ def _runtime_creds():
     }
 
 
-def test_resolve_minimax_oauth_builds_anthropic_wrapper_with_oauth_semantics():
+def test_resolve_minimax_oauth_builds_anthropic_wrapper_with_third_party_wire():
     """Happy path: token-provider + base_url → AnthropicAuxiliaryClient with the
     third-party is_oauth invariant (False for api.minimax.io), Anthropic SDK built
     with the callable bearer (not a static string), and the resolved model passed
@@ -134,20 +141,83 @@ def test_resolve_minimax_oauth_tool_names_unprefixed_on_wire():
     )
 
 
-def test_resolve_minimax_oauth_missing_credentials_returns_none_without_raising():
-    """AuthError from the runtime resolver → (None, None), no exception.
+def test_resolve_minimax_oauth_missing_credentials_log_once_debug(caplog):
+    """Absent / not-logged-in / AuthError → (None, None), no exception, and one
+    DEBUG record per process — never a per-call WARNING with traceback.
 
     The resolver contract is "absent → call_llm's fallback chain", never
     "absent → exception"; the compression step must fall through to its
-    Step-2 providers instead of crashing the turn.
+    Step-2 providers instead of crashing the turn. And because every aux task
+    (compression, title generation, background review) re-resolves on each
+    call, a per-call WARNING would recreate the exact log-spam complaint
+    #21521 was filed about — worse once a quarantine wipes the tokens.
     """
+    import agent.auxiliary_client_registry as acr
     from agent.auxiliary_client import resolve_provider_client
 
+    acr._LOGGED_MINIMAX_ABSENT_KEYS.clear()
+    acr._LOGGED_MINIMAX_UNEXPECTED_KEYS.clear()
+    resolved: tuple = (None, None)
     with patch(
         "hermes_cli.auth.resolve_minimax_oauth_runtime_credentials",
-        side_effect=Exception("not logged in"),
+        side_effect=AuthError(
+            "Not logged into MiniMax OAuth.", provider="minimax-oauth",
+            code="not_logged_in", relogin_required=True),
     ):
-        client, model = resolve_provider_client("minimax-oauth", "MiniMax-M3")
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            for _ in range(5):
+                resolved = resolve_provider_client("minimax-oauth", "MiniMax-M3")
+
+    client, model = resolved
 
     assert client is None
     assert model is None
+    recs = [r for r in caplog.records if "minimax-oauth" in r.getMessage()]
+    # Five resolutions → exactly one debug record, zero warnings, zero tracebacks.
+    assert len(recs) == 1, (
+        f"expected exactly one deduped log record, got {len(recs)}: "
+        f"{[r.getMessage() for r in recs]}"
+    )
+    assert recs[0].levelno == logging.DEBUG, (
+        "logged-out minimax-oauth must be debug-once, not a warning"
+    )
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records), (
+        "logged-out minimax-oauth must not warn per aux resolution (#21521 spam)"
+    )
+    assert not any(r.exc_info for r in caplog.records), (
+        "an expected not-logged-in state never carries a traceback"
+    )
+
+
+def test_resolve_minimax_oauth_probe_reads_raw_state_no_refresh():
+    """``aux_probe_mode()`` answers "resolvable?" for availability gates and must
+    not touch the network: the arm reads ``get_provider_auth_state("minimax-oauth")``
+    raw and stubs when access_token + inference_base_url are present, skipping the
+    refresh that an expired token would otherwise trigger (mirrors
+    ``credential_pool.py::_seed_minimax_singleton``).
+    """
+    import agent.auxiliary_client as aux
+    from agent.auxiliary_client import resolve_provider_client
+
+    expired_state = {
+        "access_token": "expired-but-present",
+        "refresh_token": "rt",
+        "expires_at": "2001-01-01T00:00:00+00:00",  # long expired
+        "inference_base_url": INFERENCE_BASE_URL,
+    }
+
+    with patch(
+        "hermes_cli.auth.get_provider_auth_state", return_value=expired_state,
+    ) as mock_state, patch(
+        "hermes_cli.auth.resolve_minimax_oauth_runtime_credentials",
+    ) as mock_resolve:
+        with aux.aux_probe_mode():
+            client, model = resolve_provider_client("minimax-oauth", "MiniMax-M3")
+
+    assert model == "MiniMax-M3"
+    assert client is not None and isinstance(client, aux._AuxProbeClientStub), (
+        "probe mode must stub minimax-oauth from the raw persisted state"
+    )
+    assert client.base_url == INFERENCE_BASE_URL
+    mock_resolve.assert_not_called()
+    mock_state.assert_called_once_with("minimax-oauth")
