@@ -21,10 +21,12 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 
 
 def validate_contract(value: str | None) -> str:
+    if value == "github_pr":
+        return value
     if value is None or value == "local-only":
         return "local-only"
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
-        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+        raise ValueError("completion_contract must be local-only, github_pr, OWNER/REPO, or an exact GitHub PR URL")
     return value
 
 
@@ -111,11 +113,12 @@ def collect_acceptance(contract: str, published_pr: str | None,
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
+        delivery = contract == "github_pr"
         profile_home = _assignee_profile_home(assignee)
         declared = _PR.fullmatch(contract)
         url = contract if declared else published_pr
         match = _PR.fullmatch(url or "")
-        if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+        if not match or (not declared and not delivery and match[1] != contract) or (declared and published_pr and published_pr != contract):
             receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
             return receipt
         repo, number = match[1], int(match[2])
@@ -133,6 +136,14 @@ def collect_acceptance(contract: str, published_pr: str | None,
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
+        if delivery:
+            receipt.update(base_branch=branch, pr_state=pr["state"], completion_contract="github_pr")
+            if branch != "staging":
+                receipt.update(classification="failure", detail="github_pr delivery requires base staging.")
+                return receipt
+            if pr["state"] != "MERGED":
+                receipt.update(classification="pending", detail="Delivery published; waiting for the PR to be merged into staging.")
+                return receipt
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
         rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
@@ -176,6 +187,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
+            return receipt
+        if delivery and (current["base"]["ref"] != "staging" or current["state"] != "closed" or current.get("merged") is not True):
+            receipt.update(classification="stale", detail="Merged staging delivery could not be confirmed on the final PR read.")
             return receipt
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
