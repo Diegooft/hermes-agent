@@ -22,6 +22,7 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
         return False
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
+    integration_pr = metadata.get("integration_pr") if isinstance(metadata, dict) else None
     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
     if contract == "github_pr":
         # Preserve the delivery mode; bind its publication in the existing durable event log.
@@ -40,7 +41,25 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
                 published_pr = pinned
             elif match:
                 _append_event(conn, task_id, "pr_publication", {"pr_url": published_pr, "completion_contract": contract}, run_id=run_id)
-        return snapshot, collect_acceptance(contract, published_pr)
+            associations = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='pr_integration' ORDER BY rowid", (task_id,)).fetchall()
+            if len(associations) > 1:
+                return False
+            if associations:
+                try:
+                    pinned_integration = json.loads(associations[0][0])["pr_url"]
+                except (ValueError, KeyError, TypeError):
+                    return False
+                if (not isinstance(pinned_integration, str) or not _PR.fullmatch(pinned_integration) or
+                    (integration_pr is not None and integration_pr != pinned_integration)):
+                    return False
+                integration_pr = pinned_integration
+            elif integration_pr is not None:
+                integration_match = _PR.fullmatch(integration_pr) if isinstance(integration_pr, str) else None
+                source_match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
+                if not integration_match or not source_match or integration_match[1] != source_match[1] or integration_pr == published_pr:
+                    return False
+                _append_event(conn, task_id, "pr_integration", {"pr_url": integration_pr, "published_pr": published_pr}, run_id=run_id)
+        return snapshot, collect_acceptance(contract, published_pr, integration_pr=integration_pr)
     # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
     if match and contract == match[1]:
         with write_txn(conn):
