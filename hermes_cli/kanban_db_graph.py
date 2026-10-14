@@ -49,8 +49,17 @@ def initial_task_state(
     if any(row["status"] != "done" for row in rows.values()):
         return "todo", tenant
     return "ready", tenant
-
-
+def find_live_task_by_idempotency_key(
+    conn: sqlite3.Connection, idempotency_key: Optional[str],
+) -> Optional[sqlite3.Row]:
+    """Return the newest non-archived task for a truthy idempotency key."""
+    if not idempotency_key:
+        return None
+    return conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? "
+        "AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+    ).fetchone()
 def _validate_children_graph(children: list) -> None:
     """DB-free shape check + Kahn's cycle check on the sibling graph (a cycle
     would deadlock every involved child in ``todo`` forever)."""

@@ -1354,7 +1354,9 @@ def create_task(
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
-    from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
+    from hermes_cli.kanban_db_graph import (
+        find_live_task_by_idempotency_key, inherit_creator_origin, initial_task_state,
+    )
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
@@ -1392,16 +1394,10 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+    # Read-only fast path; a miss is authoritatively rechecked inside the write txn.
+    row = find_live_task_by_idempotency_key(conn, idempotency_key)
+    if row is not None:
+        return row["id"]
 
     now = int(time.time())
 
@@ -1419,6 +1415,9 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                row = find_live_task_by_idempotency_key(conn, idempotency_key)
+                if row is not None:
+                    return row["id"]
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
