@@ -11,13 +11,13 @@ from hermes_cli.kanban_db_connect import connect
 
 @pytest.fixture
 def delivery_github(tmp_path, monkeypatch):
-    state = dict(base='staging', state='OPEN', merged=False, conclusion='success', head='a'*40, requests=[])
+    state = dict(base='staging', base_sha='b'*40, final_base_sha='b'*40, state='OPEN', merged=False, conclusion='success', head='a'*40, requests=[])
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             state['requests'].append(self.path)
             if self.path == '/graphql':
                 value={'data':{'repository':{'pullRequest':{'headRefOid':state['head'],
-                    'baseRefName':state['base'],'state':state['state'],
+                    'baseRefName':state['base'],'baseRefOid':state['base_sha'],'state':state['state'],
                     'baseRef':{'branchProtectionRule':{'requiredStatusChecks':[{'context':'required','app':{'databaseId':1}}]}}}}}}
             elif '/rules/branches/' in self.path: value=[[]]
             elif '/check-runs' in self.path:
@@ -26,7 +26,9 @@ def delivery_github(tmp_path, monkeypatch):
                 if state.get('race'): state['race']()
             elif '/statuses' in self.path: value=[[]]
             elif '/pulls/' in self.path:
-                value={'head':{'sha':state['head']},'base':{'ref':state['base']},
+                base={'ref':state['base']}
+                if state.get('final_base_sha') is not None: base['sha']=state['final_base_sha']
+                value={'head':{'sha':state['head']},'base':base,
                     'state':'closed' if state['merged'] else 'open','merged':state['merged']}
             else:self.send_error(404);return
             self.send_response(200);self.end_headers();self.wfile.write(json.dumps(value).encode())
@@ -82,3 +84,20 @@ def test_delivery_publication_binds_once_and_run_race_cannot_complete(delivery_g
             metadata={'published_pr':'https://github.com/acme/repo/pull/7'})
         assert kb.get_task(conn,raced).status!='done'
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",(raced,)).fetchone()[0]==0
+
+def test_delivery_rejects_absent_or_malformed_final_base_sha(delivery_github):
+    state = delivery_github
+    with connect() as conn:
+        for final_base_sha in (None, "not-a-sha"):
+            state.update(base="staging", base_sha="b" * 40, final_base_sha=final_base_sha,
+                         state="MERGED", merged=True, conclusion="success")
+            task = kb.create_task(conn, title="strict base", completion_contract="github_pr")
+            assert not kb.complete_task(
+                conn, task, result="Evidence", metadata={"published_pr": "https://github.com/acme/repo/pull/7"}
+            )
+            receipt = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (task,)
+            ).fetchone()[0])
+            assert receipt["classification"] == "infra"
+            assert kb.get_task(conn, task).status != "done"
+        state["final_base_sha"] = state["base_sha"]
