@@ -1785,17 +1785,14 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
     reached after standalone failed, so nothing was sent and a replay cannot duplicate. The ledger
     carries text only; dropped attachments are reported."""
     try:
-        from gateway.delivery_ledger import (
-            compute_obligation_id, is_reconnect_only, ledger_enabled, mark_failed, record_obligation)
-        if not is_reconnect_only(t.live_error) or not ledger_enabled():
-            return
+        from gateway.delivery_ledger import queue_reconnect_failure
         session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
-        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", content)
-        record_obligation(
-            obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
-            chat_id=str(t.chat_id), thread_id=t.thread_id, content=content,
-            adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
-        mark_failed(obligation_id, str(t.live_error))
+        recorded = queue_reconnect_failure(
+            session_key=session_key, message_ref=f"job:{t.job.get('id', '?')}",
+            platform=t.platform_name, chat_id=str(t.chat_id), thread_id=t.thread_id, content=content,
+            error=t.live_error, adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
+        if not recorded or not recorded.send_allowed:
+            return
     except Exception:
         logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
                        t.job.get("id"), t.where, exc_info=True)

@@ -19,6 +19,7 @@ import re
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from gateway.dead_targets import classify_dead_error
@@ -34,6 +35,12 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+
+@dataclass(frozen=True)
+class RecordDecision:
+    obligation_id: str
+    state: str
+    send_allowed: bool
 
 # Visible prefixes for redeliveries that might duplicate an already-received message (crash mid-send /
 # post-rejection retry) — honest at-least-once. Runtime recovery uses a distinct marker: no restart
@@ -268,21 +275,106 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> RecordDecision:
+    """Record a response and return an explicit send decision for the stable ID."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile)
                VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+        existing = conn.execute(
+            "SELECT state FROM delivery_obligations WHERE obligation_id=?", (obligation_id,)
+        ).fetchone()
+        state = existing[0] if existing else "pending"
+        if state in {"delivered", "abandoned"}:
+            return RecordDecision(obligation_id, state, False)
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
+    return RecordDecision(obligation_id, state, True)
+
+
+def record_final_obligation(*, session_key: str, message_ref: str, platform: str, chat_id: str,
+                            thread_id: Optional[str], content: str,
+                            adapter_profile: Optional[str] = None) -> str | RecordDecision | None:
+    """Atomically claim a final response for its sender, unless the ledger is disabled."""
+    if not ledger_enabled():
+        return None
+    decision = _claim_obligation(
+        obligation_id=compute_obligation_id(session_key, message_ref, content), session_key=session_key,
+        platform=platform, chat_id=chat_id, thread_id=thread_id, content=content,
+        adapter_profile=adapter_profile, state="attempting")
+    return decision.obligation_id if decision.send_allowed else decision
+
+
+def queue_reconnect_failure(*, session_key: str, message_ref: str, platform: str, chat_id: str,
+                            thread_id: Optional[str], content: str, error: Any,
+                            adapter_profile: Optional[str] = None) -> Optional[RecordDecision]:
+    """Queue one reconnect-only failure without reopening terminal delivery rows."""
+    if not is_reconnect_only(error) or not ledger_enabled():
+        return None
+    return _claim_obligation(
+        obligation_id=compute_obligation_id(session_key, message_ref, content), session_key=session_key,
+        platform=platform, chat_id=chat_id, thread_id=thread_id, content=content,
+        adapter_profile=adapter_profile, state="failed", error=str(error))
+
+
+def _claim_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str],
+                      state: str, error: str = "") -> RecordDecision:
+    """Create or CAS-claim a retryable obligation and stamp this process before transport.
+
+    ``attempting`` is intentionally never taken here: its send may be uncertain and only the
+    dead-owner recovery sweep may reclaim it.  A ``failed`` row can retry for its owner or after
+    that owner dies; a legacy ``pending`` row is only recovered after its owner dies.
+    """
+    now, (pid, started) = time.time(), _owner_stamp()
+    profile = str(adapter_profile).strip() if adapter_profile else "default"
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT state, owner_pid, owner_started_at FROM delivery_obligations
+               WHERE obligation_id=?""", (obligation_id,)).fetchone()
+        if row is None:
+            inserted = conn.execute(
+                """INSERT OR IGNORE INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, thread_id, content, state, attempts,
+                    created_at, updated_at, owner_pid, owner_started_at, last_error, adapter_profile)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
+                (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+                 content, state, now, now, pid, started, error[:500] if error else None, profile)).rowcount
+            if inserted:
+                _prune_unlocked(conn, now)
+                return RecordDecision(obligation_id, state, True)
+            row = conn.execute(
+                """SELECT state, owner_pid, owner_started_at FROM delivery_obligations
+                   WHERE obligation_id=?""", (obligation_id,)).fetchone()
+        current_state, owner_pid, owner_started_at = row
+        if current_state in {"delivered", "abandoned"}:
+            return RecordDecision(obligation_id, current_state, False)
+        same_owner = owner_pid == pid and owner_started_at == started
+        claimable = (
+            current_state == "failed" and (same_owner or not _owner_alive(owner_pid, owner_started_at))
+        ) or (current_state == "pending" and not _owner_alive(owner_pid, owner_started_at))
+        if not claimable:
+            return RecordDecision(obligation_id, current_state, False)
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state=?, owner_pid=?, owner_started_at=?, updated_at=?, last_error=?
+               WHERE obligation_id=? AND state=? AND owner_pid IS ? AND owner_started_at IS ?""",
+            (state, pid, started, now, error[:500] if error else None, obligation_id, current_state,
+             owner_pid, owner_started_at))
+        if cursor.rowcount:
+            _prune_unlocked(conn, now)
+            return RecordDecision(obligation_id, state, True)
+        state_after = conn.execute(
+            "SELECT state FROM delivery_obligations WHERE obligation_id=?", (obligation_id,)
+        ).fetchone()[0]
+    return RecordDecision(obligation_id, state_after, False)
 
 
 def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
@@ -345,8 +437,9 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
         conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id))
+               WHERE obligation_id=? AND (state NOT IN ('delivered', 'abandoned')
+                                         OR (? = 'delivered' AND state = 'attempting'))""",
+            (state, time.time(), error[:500] if error else None, obligation_id, state))
 
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,

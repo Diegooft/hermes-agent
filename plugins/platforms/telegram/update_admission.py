@@ -1,11 +1,9 @@
 """Telegram admission before every PTB handler group, including native plugins.
 
-Claims belong to the receiving adapter across Application rebuilds. Completed
-history is bounded and has no TTL in memory; dispatch and its PTB tasks pin active
-claims. Completed IDs are also written to a per-bot receipt file under the adapter's
-Hermes home, so a replacement adapter or a restarted gateway still drops updates that
-Telegram redelivers because their getUpdates/webhook acknowledgement never landed.
-No cross-process coordination or exactly-once effects are promised.
+Claims belong to the receiving adapter across Application rebuilds. Accepted local
+handoff receipts are bounded and persisted per bot; dispatch and PTB tasks pin active
+claims. They do not establish Telegram transport acknowledgement, callback completion,
+exactly-once effects, or cross-process coordination.
 """
 
 import asyncio
@@ -40,7 +38,7 @@ def _receipt_path(adapter, bot_id):
 
 
 def _load_receipts(adapter, bot_id) -> None:
-    """Seed completed history from disk once per bot, before its first admission check."""
+    """Seed accepted local handoff receipts once per bot, before admission checks."""
     if bot_id in adapter._update_receipts_loaded:
         return
     adapter._update_receipts_loaded.add(bot_id)
@@ -65,41 +63,58 @@ def _load_receipts(adapter, bot_id) -> None:
             bounded_put(seen, key, ts, _SEEN_CAP)
 
 
+async def _write_receipt_snapshot(adapter, bot_id: str, *, prospective_key: str | None = None) -> float:
+    """Serialize receipt snapshots so an older flush cannot overwrite a handoff."""
+    from hermes_constants import mkdir_under_hermes_home
+
+    lock = getattr(adapter, "_update_receipt_write_lock", None)
+    if lock is None:
+        adapter._update_receipt_write_lock = lock = asyncio.Lock()
+    async with lock:
+        now = time.time()
+        seen = dict(adapter._seen_update_ids)
+        if prospective_key is not None:
+            bounded_put(seen, prospective_key, now, _SEEN_CAP)
+        prefix, cutoff = f"{bot_id}:", now - RECEIPT_TTL_SECONDS
+        ids = {key[len(prefix):]: ts for key, ts in seen.items()
+               if key.startswith(prefix) and isinstance(ts, float) and ts > cutoff}
+        path = _receipt_path(adapter, bot_id)
+        mkdir_under_hermes_home(path.parent)
+        await asyncio.to_thread(
+            atomic_json_write, path, {"update_ids": ids}, indent=None, fsync_dir=True)
+        return now
+
+
 def _record_receipt(adapter, key: str) -> None:
     bounded_put(adapter._seen_update_ids, key, time.time(), _SEEN_CAP)
     adapter._update_receipts_dirty.add(key.split(":", 1)[0])
     task = adapter._update_receipt_flush
     if task is None or task.done():
-        # One writer per adapter coalesces bursts; the fsync stays off the event loop.
         adapter._update_receipt_flush = asyncio.get_running_loop().create_task(
             _flush_receipts(adapter), name="telegram-update-receipts")
 
 
 async def _flush_receipts(adapter) -> None:
-    from hermes_constants import mkdir_under_hermes_home
-
     while adapter._update_receipts_dirty:
         bot_id = adapter._update_receipts_dirty.pop()
-        prefix, cutoff = f"{bot_id}:", time.time() - RECEIPT_TTL_SECONDS
-        # Snapshot on the loop: admission mutates this dict only from loop callbacks.
-        ids = {key[len(prefix):]: ts for key, ts in adapter._seen_update_ids.items()
-               if key.startswith(prefix) and isinstance(ts, float) and ts > cutoff}
-        path = _receipt_path(adapter, bot_id)
         try:
-            mkdir_under_hermes_home(path.parent)
-            await asyncio.to_thread(atomic_json_write, path, {"update_ids": ids}, indent=None)
+            await _write_receipt_snapshot(adapter, bot_id)
         except Exception:
-            logger.warning("[Telegram] Failed to persist update receipts to %s", path, exc_info=True)
+            logger.warning("[Telegram] Failed to persist update receipts at %s",
+                           _receipt_path(adapter, bot_id), exc_info=True)
 
 
 @dataclass
 class _Claim:
     key: str
     dispatch_task: asyncio.Task | None
+    application: "TelegramApplication"
     accepted: bool = False
     completed: bool = False
     failed: bool = False
     owners: int = 1
+    receipt_task: asyncio.Task | None = None
+    receipt_state: str | None = None
 
 
 class _ErrorCallback:
@@ -122,7 +137,7 @@ class _ErrorCallback:
         admission = getattr(context.application, "_current_claim", None)
         claim = admission.get() if admission is not None else None
         if claim is not None and claim.owners:
-            claim.accepted = True
+            await _await_durable_handoff(claim)
         return await self.__wrapped__(update, context)
 
 
@@ -178,8 +193,47 @@ def build_update_processor(extra, name: str) -> PerChatUpdateProcessor:
     return PerChatUpdateProcessor(limit)
 
 
+async def _await_durable_handoff(claim: _Claim) -> None:
+    task = claim.receipt_task
+    if task is None:
+        claim.application._start_durable_handoff(claim)
+        task = claim.receipt_task
+    if task is not None:
+        await asyncio.shield(task)
+
+
+async def accept_update_durable(adapter) -> None:
+    """Persist the receiving claim before an irreversible core handoff."""
+    admission = getattr(adapter, "_update_admission", None)
+    claim = admission.get() if admission is not None else None
+    if claim is not None:
+        await _await_durable_handoff(claim)
+
+
+def fail_update_preparation(adapter) -> None:
+    """Keep pre-handoff failures eligible for redelivery."""
+    admission = getattr(adapter, "_update_admission", None)
+    claim = admission.get() if admission is not None else None
+    if claim is not None:
+        claim.failed = True
+
+
+async def enqueue_text_event(adapter, event, enqueue) -> None:
+    """Prepare identity before durable intent, then use the existing batch sink."""
+    if adapter._should_drop_delayed_delivery():
+        if not adapter._is_permanent_fatal():
+            await adapter._accept_update_durable()
+        adapter._hold_inbound_event(event, where="text-enqueue")
+        return
+    if adapter._drop_unresolved(event):
+        return
+    key = adapter._text_batch_key(event)
+    await adapter._accept_update_durable()
+    enqueue(event, prepared_key=key)
+
+
 class TelegramApplication(Application):
-    __slots__ = ("adapter", "_current_claim")
+    __slots__ = ("adapter", "_current_claim", "_release_waiters", "_receipt_barriers")
 
     def __init__(self, *, adapter, **kwargs):
         super().__init__(**kwargs)
@@ -187,6 +241,8 @@ class TelegramApplication(Application):
         if adapter._update_admission is None:
             adapter._update_admission = ContextVar[_Claim | None]("telegram_update_claim", default=None)
         self._current_claim: ContextVar[_Claim | None] = adapter._update_admission
+        self._release_waiters: set[asyncio.Future] = set()
+        self._receipt_barriers: set[asyncio.Task] = set()
 
     def add_handler(self, handler, group=0):
         super().add_handler(handler, group)
@@ -214,7 +270,7 @@ class TelegramApplication(Application):
             admission = getattr(application, "_current_claim", None)
             claim = admission.get() if admission is not None else None
             if claim is not None and getattr(callback, "__self__", None) is not application.adapter:
-                claim.accepted = True
+                await _await_durable_handoff(claim)
             result = await callback(update, context)
             if claim is not None:
                 if claim.failed and not claim.accepted:
@@ -247,12 +303,17 @@ class TelegramApplication(Application):
         if claim is not None and claim.owners:
             # Pin scheduled work before callback entry, including cancellation before entry.
             claim.owners += 1
+            waiter = asyncio.get_running_loop().create_future()
+            self._release_waiters.add(waiter)
 
             def finished(done):
                 # PTB's task wrapper may never start, leaving its callback unawaited.
                 if done.cancelled() and asyncio.iscoroutine(coroutine):
                     coroutine.close()
                 self._release_claim(claim, done)
+                self._release_waiters.discard(waiter)
+                if not waiter.done():
+                    waiter.set_result(None)
 
             task.add_done_callback(finished)
         return task
@@ -263,9 +324,40 @@ class TelegramApplication(Application):
         claim.owners -= 1
         if claim.owners:
             return
-        del self.adapter._inflight_update_ids[claim.key]
+        self.adapter._inflight_update_ids.pop(claim.key, None)
         if claim.accepted or (claim.completed and not claim.failed):
             _record_receipt(self.adapter, claim.key)
+
+    def _start_durable_handoff(self, claim: _Claim) -> None:
+        async def persist():
+            bot_id = claim.key.split(":", 1)[0]
+            timestamp = await _write_receipt_snapshot(self.adapter, bot_id, prospective_key=claim.key)
+            bounded_put(self.adapter._seen_update_ids, claim.key, timestamp, _SEEN_CAP)
+            claim.accepted = True
+            claim.receipt_state = "ACCEPTED_UNKNOWN_EFFECT"
+
+        claim.owners += 1
+        task = asyncio.get_running_loop().create_task(persist(), name="telegram-update-durable-handoff")
+        claim.receipt_task = task
+        self._receipt_barriers.add(task)
+
+        def finished(done):
+            try:
+                if done.cancelled() or done.exception() is not None:
+                    claim.failed = True
+            finally:
+                self._receipt_barriers.discard(done)
+                self._release_claim(claim, done)
+
+        task.add_done_callback(finished)
+
+    async def stop(self, *args, **kwargs):
+        await super().stop(*args, **kwargs)
+        while self._release_waiters:
+            await asyncio.gather(*tuple(self._release_waiters))
+        barriers = tuple(self._receipt_barriers)
+        if barriers:
+            await asyncio.gather(*barriers, return_exceptions=True)
 
     async def process_error(self, update, error, job=None, coroutine=None):
         claim = self._current_claim.get()
@@ -281,13 +373,13 @@ class TelegramApplication(Application):
         bot_id = self.bot.id
         key = f"{bot_id}:{update.update_id}"
         _load_receipts(self.adapter, bot_id)
-        # Dispatch happened even when preparation fails before the group-99 observer.
+        # PTB may dispatch before an accepted local handoff receipt exists.
         self.adapter._updates_dispatched_total += 1
         seen = self.adapter._seen_update_ids
         pending = self.adapter._inflight_update_ids
         if key in seen or key in pending:
             return
-        claim = _Claim(key, asyncio.current_task())
+        claim = _Claim(key, asyncio.current_task(), self)
         # Atomic on PTB's event loop: no await between lookup and claim. Dispatch and its
         # PTB tasks share ownership; completed-history pressure cannot evict active work.
         pending[key] = claim
