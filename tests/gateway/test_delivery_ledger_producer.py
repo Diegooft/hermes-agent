@@ -157,10 +157,16 @@ class TestProducerHook:
         adapter = _Adapter()
         slow_record, event_loop_witness, blocked_event_loop = _blocking_probe()
 
+        record_final = dl.record_final_obligation
+
+        def slow_final_record(*args, **kwargs):
+            slow_record(*args, **kwargs)
+            return record_final(*args, **kwargs)
+
         with patch(
-            "gateway.delivery_ledger.record_obligation",
-            side_effect=slow_record,
-        ), patch("gateway.delivery_ledger.mark_attempting"):
+            "gateway.delivery_ledger.record_final_obligation",
+            side_effect=slow_final_record,
+        ):
             await asyncio.gather(_run(adapter, _event()), event_loop_witness())
 
         assert blocked_event_loop == []
