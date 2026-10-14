@@ -13,7 +13,7 @@ from hermes_cli.kanban_db_connect import connect
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
-    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+    state = {"conclusion": "success", "head": "a" * 40, "base_sha": "b" * 40, "reads": 0, "requests": []}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -21,7 +21,7 @@ def github(tmp_path, monkeypatch):
             sha = state["head"]
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "headRefOid": sha, "baseRefName": "main", "baseRefOid": state["base_sha"], "state": "OPEN",
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
             elif "/rules/branches/" in self.path:
@@ -43,7 +43,7 @@ def github(tmp_path, monkeypatch):
             elif "/statuses" in self.path:
                 value = [[]]
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                value = {"head": {"sha": sha}, "base": {"ref": "main", "sha": state["base_sha"]}, "state": "open"}
             else:
                 self.send_error(404)
                 return
@@ -230,3 +230,24 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+@pytest.mark.platforms("linux")
+def test_pr_completion_rejects_same_named_base_advanced_during_collection(github):
+    """A same-name base ref is not the same acceptance target after it advances."""
+    with connect() as conn:
+        github.update(conclusion="success", head="a" * 40, base_sha="b" * 40)
+        def advance_base_only():
+            github["base_sha"] = "c" * 40
+        github["race"] = advance_base_only
+        task_id = kb.create_task(conn, title="base race", completion_contract="acme/repo")
+        assert not kb.complete_task(
+            conn, task_id, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"}
+        )
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (task_id,)
+        ).fetchone()[0])
+        assert receipt["classification"] == "stale"
+        assert receipt["base_sha"] == "b" * 40
+        assert kb.get_task(conn, task_id).status != "done"
+        github.pop("race")

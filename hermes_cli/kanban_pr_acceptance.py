@@ -109,7 +109,7 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
 def collect_acceptance(contract: str, published_pr: str | None,
                        assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
-               "pr_url": published_pr, "checks": [],
+               "base_sha": None, "pr_url": published_pr, "checks": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
@@ -124,7 +124,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
+        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName baseRefOid state
             baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
                 json.dumps(owner), json.dumps(name), number)
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
@@ -132,9 +132,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
             # A private repo the login cannot read resolves to null, not an error.
             raise _GateAuthError(f"HTTP 404 on graphql {repo}")
         pr = repository["pullRequest"]
-        sha, branch = pr["headRefOid"], pr["baseRefName"]
-        receipt["head_sha"] = sha
-        if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
+        sha, branch, base_sha = pr["headRefOid"], pr["baseRefName"], pr["baseRefOid"]
+        receipt.update(head_sha=sha, base_sha=base_sha)
+        if (not re.fullmatch(r"[0-9a-f]{40}", sha)
+                or not re.fullmatch(r"[0-9a-f]{40}", base_sha)
+                or pr["state"] not in {"OPEN", "MERGED"}):
             raise ValueError("PR is closed or current head is unavailable")
         if delivery:
             receipt.update(base_branch=branch, pr_state=pr["state"], completion_contract="github_pr")
@@ -185,7 +187,13 @@ def collect_acceptance(contract: str, published_pr: str | None,
                     "classification": classification, "conclusion": outcome})
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
-        if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
+        current_base_sha = current["base"]["sha"]
+        if not isinstance(current_base_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", current_base_sha):
+            receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
+            return receipt
+        if (current["head"]["sha"] != sha or current["base"]["ref"] != branch
+                or current_base_sha != base_sha
+                or (current["state"] == "closed" and not current.get("merged"))):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
         if delivery and (current["base"]["ref"] != "staging" or current["state"] != "closed" or current.get("merged") is not True):
