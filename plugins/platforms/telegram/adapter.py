@@ -589,8 +589,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         from hermes_constants import get_hermes_home
         self._update_receipt_dir = get_hermes_home()
         self._update_receipts_loaded: set = set()
-        self._update_receipts_dirty: set = set()
-        self._update_receipt_flush: Optional[asyncio.Task] = None
+        self._update_receipts_dirty, self._update_receipt_flush = set(), None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
@@ -2767,7 +2766,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # The gateway-owned boundary runs the full profile-scoped auth chain before plugin dispatch.
         try:
             source = self._source_for_platform_event_auth(update)
-            self._accept_update()
+            await self._accept_update_durable()
             await handler(event, source)
         except Exception:
             self._fail_update_preparation()
@@ -2864,22 +2863,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 "text": text[:8192] if text is not None else None, "edited_at": edited_at},
         }
 
-    def _accept_update(self) -> None:
-        """Handoff is irreversible for replay purposes, even if later work raises/cancels."""
-        admission = getattr(self, "_update_admission", None)
-        claim = admission.get() if admission is not None else None
-        if claim is not None:
-            claim.accepted = True
+    async def _accept_update_durable(self) -> None:
+        from plugins.platforms.telegram.update_admission import accept_update_durable
+        await accept_update_durable(self)
 
     def _fail_update_preparation(self) -> None:
-        """A caught preparation error is not a successful no-op or an auth refusal."""
-        admission = getattr(self, "_update_admission", None)
-        claim = admission.get() if admission is not None else None
-        if claim is not None:
-            claim.failed = True
+        from plugins.platforms.telegram.update_admission import fail_update_preparation
+        fail_update_preparation(self)
 
     async def handle_message(self, event: MessageEvent) -> None:
-        self._accept_update()
+        await self._accept_update_durable()
         await super().handle_message(event)
 
     def _register_handlers(self, app) -> None:
@@ -3425,7 +3418,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         self._app = None
         self._bot = None
-        # Land the last completed receipts before a replacement adapter reads them.
         flush = getattr(self, "_update_receipt_flush", None)
         if flush is not None and not flush.done():
             await self._await_disconnect_step(asyncio.shield(flush), _DISCONNECT_STEP_TIMEOUT, "update-receipt flush")
@@ -4637,7 +4629,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not authorized:
             try:
                 from plugins.platforms.telegram.inline_picker import CACHE_TIME_SECONDS as _deny_cache
-                self._accept_update()
+                await self._accept_update_durable()
                 await inline_query.answer([], cache_time=_deny_cache, is_personal=True)
             except Exception:
                 self._fail_update_preparation()
@@ -4657,7 +4649,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 for r in results
            ]
             # is_personal: catalogs differ per user (auth, disabled skills) — never share cached pages.
-            self._accept_update()
+            await self._accept_update_durable()
             await inline_query.answer(articles, cache_time=_CACHE, is_personal=True, next_offset=next_offset)
         except Exception:
             self._fail_update_preparation()
@@ -4687,7 +4679,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         query = update.callback_query
         if not query or not query.data:
             return
-        self._accept_update()
+        await self._accept_update_durable()
         data = query.data
         cb = self._callback_ctx(query)
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
@@ -6322,7 +6314,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 name=named, error=exc.__class__.__name__))
             if notice:
                 try:
-                    self._accept_update()
+                    await self._accept_update_durable()
                     await msg.reply_text(notice)
                 except Exception as reply_err:
                     logger.warning("[Telegram] Failed to notify user about %s cache failure: %s", kind, reply_err, exc_info=True)
@@ -6333,7 +6325,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 if notice else f"[The user attempted to send a {kind}{named} but it could not be downloaded.]",
             )
 
-    def _observe_unmentioned_group_message(
+    async def _observe_unmentioned_group_message(
         self, message: Message, msg_type: MessageType, update_id: Optional[int] = None, event: Optional[MessageEvent] = None) -> None:
         """Append skipped group chatter to the target session without dispatching."""
         store = getattr(self, "_session_store", None)
@@ -6348,7 +6340,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 "timestamp": datetime.now(tz=timezone.utc).isoformat(), "observed": True}
             if event.message_id:
                 entry["message_id"] = str(event.message_id)
-            self._accept_update()
+            await self._accept_update_durable()
             store.append_to_transcript(session_entry.session_id, entry)
             logger.info(
                 "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s", adapter_name,
@@ -6448,12 +6440,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             level, "[Telegram] Blocked %s %s in chat %s", what, getattr(getattr(msg, "from_user", None), "id", None),
             getattr(getattr(msg, "chat", None), "id", None))
 
-    def _gate_or_observe(self, msg, update, msg_type: MessageType) -> bool:
+    async def _gate_or_observe(self, msg, update, msg_type: MessageType) -> bool:
         """Group trigger gate; observes unmentioned chatter when configured. True = proceed."""
         if self._should_process_message(msg):
             return True
         if self._should_observe_unmentioned_group_message(msg):
-            self._observe_unmentioned_group_message(msg, msg_type, update_id=update.update_id)
+            await self._observe_unmentioned_group_message(msg, msg_type, update_id=update.update_id)
         return False
 
     async def _build_triggered_event(self, msg, update, msg_type: MessageType) -> MessageEvent:
@@ -6474,10 +6466,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
             return
-        if not self._gate_or_observe(msg, update, MessageType.TEXT):
+        if not await self._gate_or_observe(msg, update, MessageType.TEXT):
             return
         await self._ensure_forum_commands(update.message)
-        self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
+        await self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -6494,7 +6486,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
         # immediately would orphan them. Near-limit commands go through text batching.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
-            self._enqueue_text_event(event)
+            await self._enqueue_text_event(event)
             return
         await self.handle_message(event)
 
@@ -6506,7 +6498,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
             return
-        if not self._gate_or_observe(msg, update, MessageType.LOCATION):
+        if not await self._gate_or_observe(msg, update, MessageType.LOCATION):
             return
         venue = getattr(msg, "venue", None)
         location = getattr(venue, "location", None) if venue else getattr(msg, "location", None)
@@ -6538,13 +6530,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._apply_topic_recovery(event)
         return super()._text_batch_key(event)
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
-        """Buffer a text chunk, or hold it while delayed delivery must be dropped."""
-        if self._should_drop_delayed_delivery():
-            self._hold_inbound_event(event, where="text-enqueue")
-            return
-        super()._enqueue_text_event(event)
-        self._accept_update()
+    async def _enqueue_text_event(self, event: MessageEvent) -> None:
+        from plugins.platforms.telegram.update_admission import enqueue_text_event
+        await enqueue_text_event(self, event, super()._enqueue_text_event)
 
     async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:
         """Shared delayed-flush body: sleep, pop, hold if teardown started, else dispatch. A cancel after
@@ -6624,13 +6612,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
 
-    def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
+    async def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
         if self._should_drop_delayed_delivery():
+            if not self._is_permanent_fatal():
+                await self._accept_update_durable()
             self._hold_inbound_event(event, where="photo-enqueue")
             return
+        await self._accept_update_durable()
         self._merge_into_pending(self._pending_photo_batches, batch_key, event)
-        self._accept_update()
         prior_task = self._pending_photo_batch_tasks.get(batch_key)
         if prior_task and not prior_task.done():
             prior_task.cancel()
@@ -6644,7 +6634,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
         else:
-            self._enqueue_photo_event(self._photo_batch_key(event, msg), event)
+            await self._enqueue_photo_event(self._photo_batch_key(event, msg), event)
 
     @staticmethod
     def _ext_from_path(file_path: Optional[str], candidates, default: str) -> str:
@@ -6792,7 +6782,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 if msg.caption:
                     _event.text = self._clean_bot_trigger_text(expand_link_entities(msg))
                 await self._cache_observed_media(msg, _event)
-                self._observe_unmentioned_group_message(msg, _event.message_type, update_id=update.update_id, event=_event)
+                await self._observe_unmentioned_group_message(msg, _event.message_type, update_id=update.update_id, event=_event)
             return
         event = self._build_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
         if msg.caption:
@@ -6840,10 +6830,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         """Debounce album items (shared media_group_id) into one MessageEvent so the second image isn't
         treated as a new message interrupting the first."""
         if self._should_drop_delayed_delivery():
+            if not self._is_permanent_fatal():
+                await self._accept_update_durable()
             self._hold_inbound_event(event, where="media-group-enqueue")
             return
+        await self._accept_update_durable()
         self._merge_into_pending(self._media_group_events, media_group_id, event)
-        self._accept_update()
         prior_task = self._media_group_tasks.get(media_group_id)
         if prior_task:
             prior_task.cancel()
@@ -6876,7 +6868,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=".webp")
             logger.info("[Telegram] Analyzing sticker at %s", cached_path)
             from tools.vision_tools import vision_analyze_tool
-            self._accept_update()  # Cancellation cannot undo an already submitted auxiliary LLM request.
+            await self._accept_update_durable()  # Cancellation cannot undo an already submitted auxiliary LLM request.
             result = json.loads(await vision_analyze_tool(image_url=cached_path, user_prompt=STICKER_VISION_PROMPT))
             if result.get("success"):
                 description = result.get("analysis", "a sticker")

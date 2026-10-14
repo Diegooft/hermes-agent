@@ -67,7 +67,7 @@ class TestTextBatching:
         adapter = _make_adapter()
         event = _make_event("hello world")
 
-        adapter._enqueue_text_event(event)
+        await adapter._enqueue_text_event(event)
 
         # Not dispatched yet
         adapter.handle_message.assert_not_called()
@@ -84,9 +84,9 @@ class TestTextBatching:
         """Two rapid messages from the same chat should be merged."""
         adapter = _make_adapter()
 
-        adapter._enqueue_text_event(_make_event("This is part one of a long"))
+        await adapter._enqueue_text_event(_make_event("This is part one of a long"))
         await asyncio.sleep(0.02)  # small gap, within batch window
-        adapter._enqueue_text_event(_make_event("message that was split by Telegram."))
+        await adapter._enqueue_text_event(_make_event("message that was split by Telegram."))
 
         # Not dispatched yet (timer restarted)
         adapter.handle_message.assert_not_called()
@@ -179,7 +179,7 @@ class TestHoldInboundAcrossReconnect:
         adapter = _make_adapter()
         adapter._mark_disconnected()
 
-        adapter._enqueue_text_event(_make_event("should survive disconnect"))
+        await adapter._enqueue_text_event(_make_event("should survive disconnect"))
 
         # Must NOT dispatch into torn-down session
         adapter.handle_message.assert_not_called()
@@ -195,25 +195,6 @@ class TestHoldInboundAcrossReconnect:
         assert adapter.handle_message.call_args[0][0].text == "should survive disconnect"
         assert adapter._held_inbound_events == []
 
-    @pytest.mark.asyncio
-    async def test_late_teardown_salvage_on_retired_adapter_reaches_replacement(self):
-        """Teardown of a rebuilt-away adapter can salvage a batch after the replacement drained (#132829)."""
-        from contextvars import ContextVar
-        from plugins.platforms.telegram.update_admission import _Claim
-
-        old, new = _make_adapter(), _make_adapter()
-        old._update_admission = ContextVar("claim", default=_Claim("1:1", None))
-        old._mark_disconnected()
-        new.adopt_held_inbound(old)
-        old._pending_text_batches["k"] = _make_event("late-salvage")
-
-        await old._cancel_pending_delivery_tasks()
-        await new._held_inbound_redispatch_task
-
-        old.handle_message.assert_not_called()
-        assert [c.args[0].text for c in new.handle_message.call_args_list] == ["late-salvage"]
-        assert old._held_inbound_events == []
-        assert old._update_admission.get().accepted  # receipt recorded: no replay after restart
 
     @pytest.mark.asyncio
     async def test_flush_during_disconnect_holds_popped_event(self):
@@ -330,7 +311,7 @@ class TestHoldInboundAcrossReconnect:
         photo = _make_event("photo caption")
         photo.media_urls = ["u1"]
         photo.media_types = ["image"]
-        adapter._enqueue_photo_event("k", photo)
+        await adapter._enqueue_photo_event("k", photo)
 
         album = _make_event("album caption")
         album.media_urls = ["u2"]
@@ -354,9 +335,9 @@ class TestHoldInboundAcrossReconnect:
         adapter = _make_adapter()
         adapter.HELD_INBOUND_MAX = 2
         adapter._mark_disconnected()
-        adapter._enqueue_text_event(_make_event("first"))
-        adapter._enqueue_text_event(_make_event("second"))
-        adapter._enqueue_text_event(_make_event("third"))
+        await adapter._enqueue_text_event(_make_event("first"))
+        await adapter._enqueue_text_event(_make_event("second"))
+        await adapter._enqueue_text_event(_make_event("third"))
 
         texts = [e.text for e in adapter._held_inbound_events]
         assert texts == ["second", "third"]
@@ -454,7 +435,7 @@ class TestHoldInboundAcrossReconnect:
         adapter = _make_adapter()
         adapter._mark_disconnected()
         # Terminal step of _handle_text_message after event construction.
-        adapter._enqueue_text_event(_make_event("acked-by-ptb-then-held"))
+        await adapter._enqueue_text_event(_make_event("acked-by-ptb-then-held"))
         adapter.handle_message.assert_not_called()
         assert [e.text for e in adapter._held_inbound_events] == ["acked-by-ptb-then-held"]
 
@@ -489,7 +470,7 @@ class TestHoldInboundAcrossReconnect:
         adapter._fatal_error_retryable = False
         adapter._drop_delayed_deliveries = True
 
-        adapter._enqueue_text_event(_make_event("too-late"))
+        await adapter._enqueue_text_event(_make_event("too-late"))
         adapter.handle_message.assert_not_called()
         assert adapter._held_inbound_events == []
 

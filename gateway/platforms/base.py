@@ -2571,11 +2571,11 @@ class BasePlatformAdapter(ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
-    def _enqueue_text_event(self, event: "MessageEvent") -> None:
+    def _enqueue_text_event(self, event: "MessageEvent", *, prepared_key: Optional[str] = None) -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
             return
-        key = self._text_batch_key(event)
+        key = self._text_batch_key(event) if prepared_key is None else prepared_key
         existing = self._pending_text_batches.get(key)
         if existing is None:
             existing = self._pending_text_batches[key] = event

@@ -6,6 +6,7 @@ and model work are stand-ins; registration, gating, batching and PTB are real.
 
 import asyncio
 import json
+import threading
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -313,9 +314,9 @@ async def _check_nonblocking_plugin(monkeypatch, adapter, app, stage, failure):
         for handlers in app.handlers.values():
             for handler in handlers:
                 handler.block = True
-        handler = TypeHandler(Update, native)
+        handler = MessageHandler(filters.ALL, native)
     else:
-        handler = TypeHandler(Update, native, block=False)
+        handler = MessageHandler(filters.ALL, native, block=False)
     if stage.startswith("conversation"):
         handler = ConversationHandler(entry_points=[handler], states={}, fallbacks=[])
     app.add_handler(handler, group=-1)
@@ -662,8 +663,8 @@ async def test_only_pre_handoff_failure_reopens_admission(monkeypatch, tmp_path,
         def key_failure(event):
             raise RuntimeError("no batch key yet") if failure == "error" else asyncio.CancelledError()
 
-        def enqueue_then_fail(event):
-            enqueue(event)
+        async def enqueue_then_fail(event):
+            await enqueue(event)
             # Inject the failure immediately after the real batch mutation, before callback return.
             raise RuntimeError("accepted test failure") if failure == "error" else asyncio.CancelledError()
 
@@ -795,6 +796,288 @@ async def test_redelivery_to_rebuilt_adapter_is_dropped(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_nonblocking_plugin_effect_waits_for_durable_update_receipt(monkeypatch, tmp_path):
+    """A native nonblocking plugin cannot run before its update ID is durable.
+
+    PTB may let ``process_update`` return after scheduling a ``block=False`` handler.
+    The receipt write therefore has to be the admission boundary, rather than a
+    background flush after the plugin has already made an irreversible effect.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.platforms.telegram import update_admission
+
+    receipt = tmp_path / "telegram_update_receipts_111.json"
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    effect_finished = asyncio.Event()
+    effects = []
+    real_writer = update_admission.atomic_json_write
+
+    def write_after_barrier(path, payload, **kwargs):
+        writer_entered.set()
+        assert release_writer.wait(2), "test did not release the isolated receipt writer"
+        real_writer(path, payload, **kwargs)
+
+    async def irreversible_plugin(incoming, context):
+        effects.append(incoming.update_id)
+        persisted = json.loads(receipt.read_text(encoding="utf-8"))
+        assert "10" in persisted["update_ids"]
+        effect_finished.set()
+
+    home_token = set_hermes_home_override(tmp_path)
+    try:
+        monkeypatch.setattr(update_admission, "atomic_json_write", write_after_barrier)
+        async with connected(monkeypatch) as (adapter, app, delivered):
+            app.add_handler(TypeHandler(Update, irreversible_plugin, block=False), group=-1)
+            dispatch = asyncio.create_task(app.process_update(update(app.bot)))
+            try:
+                assert await asyncio.to_thread(writer_entered.wait, 1), "durable writer was not reached"
+                assert effects == [], "plugin effect ran before the durable receipt completed"
+            finally:
+                release_writer.set()
+            await asyncio.wait_for(dispatch, 2)
+            await asyncio.wait_for(effect_finished.wait(), 2)
+            assert json.loads(receipt.read_text(encoding="utf-8"))["update_ids"].get("10") is not None
+
+        # A rebuilt adapter reads the receipt before PTB dispatch and drops the redelivery.
+        async with connected(monkeypatch, is_reconnect=True) as (rebuilt_adapter, rebuilt_app, rebuilt_delivered):
+            await rebuilt_app.process_update(update(rebuilt_app.bot))
+            await asyncio.gather(*rebuilt_adapter._pending_text_batch_tasks.values())
+            assert rebuilt_delivered == []
+    finally:
+        release_writer.set()
+        reset_hermes_home_override(home_token)
+
+
+@pytest.mark.asyncio
+async def test_receipt_write_failure_before_rename_blocks_plugin_but_allows_redelivery(monkeypatch, tmp_path):
+    """A pre-rename receipt failure has no accepted update and no plugin effect to replay."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.platforms.telegram import update_admission
+
+    write_failed = threading.Event()
+    plugin_ran = asyncio.Event()
+    effects = []
+
+    def fail_before_rename(*args, **kwargs):
+        write_failed.set()
+        raise OSError("simulated receipt write failure before rename")
+
+    async def irreversible_plugin(incoming, context):
+        effects.append(incoming.update_id)
+        plugin_ran.set()
+
+    home_token = set_hermes_home_override(tmp_path)
+    try:
+        async with connected(monkeypatch) as (adapter, app, _):
+            app.add_handler(TypeHandler(Update, irreversible_plugin, block=False), group=-1)
+            with monkeypatch.context() as failed_write:
+                failed_write.setattr(update_admission, "atomic_json_write", fail_before_rename)
+                await asyncio.wait_for(app.process_update(update(app.bot)), 2)
+                assert await asyncio.to_thread(write_failed.wait, 1), "receipt failure path was not reached"
+                assert effects == [], "plugin effect ran after the receipt write failed"
+                assert "111:10" not in adapter._seen_update_ids
+
+            await asyncio.wait_for(app.process_update(update(app.bot)), 2)
+            await asyncio.wait_for(plugin_ran.wait(), 2)
+            assert effects == [10]
+    finally:
+        reset_hermes_home_override(home_token)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_keeps_durable_claim_until_stop_drains_success(monkeypatch, tmp_path):
+    """Caller cancellation cannot release an accepted-unknown-effect claim before disk settles."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.platforms.telegram import update_admission
+
+    receipt = tmp_path / "telegram_update_receipts_111.json"
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    stop_entered = asyncio.Event()
+    effects = []
+    real_writer = update_admission.atomic_json_write
+
+    def write_after_barrier(path, payload, **kwargs):
+        writer_entered.set()
+        assert release_writer.wait(2), "test did not release the isolated receipt writer"
+        real_writer(path, payload, **kwargs)
+
+    async def irreversible_plugin(incoming, context):
+        effects.append(incoming.update_id)
+
+    home_token = set_hermes_home_override(tmp_path)
+    try:
+        monkeypatch.setattr(update_admission, "atomic_json_write", write_after_barrier)
+        with monkeypatch.context() as stop_patch:
+            async with connected(monkeypatch) as (adapter, app, _):
+                app.add_handler(TypeHandler(Update, irreversible_plugin, block=True), group=-1)
+                dispatch = asyncio.create_task(app.process_update(update(app.bot)))
+                assert await asyncio.to_thread(writer_entered.wait, 1), "durable writer was not reached"
+                assert not dispatch.done(), "dispatch did not wait for the owned receipt barrier"
+                dispatch.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await dispatch
+                assert "111:10" in adapter._inflight_update_ids, "cancellation released an unknown disk outcome"
+
+                real_stop = type(app).stop
+
+                async def observed_stop(self, *args, **kwargs):
+                    if self is app:
+                        stop_entered.set()
+                    return await real_stop(self, *args, **kwargs)
+
+                stop_patch.setattr(type(app), "stop", observed_stop)
+                stop_task = asyncio.create_task(app.stop())
+                await asyncio.wait_for(stop_entered.wait(), 1)
+                assert not stop_task.done(), "stop returned before the owned receipt write settled"
+                release_writer.set()
+                await asyncio.wait_for(stop_task, 2)
+                assert effects == [], "callback ran after caller cancellation"
+                assert json.loads(receipt.read_text(encoding="utf-8"))["update_ids"].get("10") is not None
+
+        async with connected(monkeypatch, is_reconnect=True) as (rebuilt_adapter, rebuilt_app, rebuilt_delivered):
+            await rebuilt_app.process_update(update(rebuilt_app.bot))
+            await asyncio.gather(*rebuilt_adapter._pending_text_batch_tasks.values())
+            assert rebuilt_delivered == []
+    finally:
+        release_writer.set()
+        reset_hermes_home_override(home_token)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_after_pre_rename_failure_allows_redelivery(monkeypatch, tmp_path):
+    """The same cancellation race reopens only after the owned writer reports failure."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.platforms.telegram import update_admission
+
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    stop_entered = asyncio.Event()
+    effects = []
+
+    def fail_after_barrier(*args, **kwargs):
+        writer_entered.set()
+        assert release_writer.wait(2), "test did not release the isolated failing writer"
+        raise OSError("simulated receipt write failure before rename")
+
+    async def irreversible_plugin(incoming, context):
+        effects.append(incoming.update_id)
+
+    home_token = set_hermes_home_override(tmp_path)
+    try:
+        with monkeypatch.context() as failed_write:
+            failed_write.setattr(update_admission, "atomic_json_write", fail_after_barrier)
+            with monkeypatch.context() as stop_patch:
+                async with connected(monkeypatch) as (adapter, app, _):
+                    app.add_handler(TypeHandler(Update, irreversible_plugin, block=True), group=-1)
+                    dispatch = asyncio.create_task(app.process_update(update(app.bot)))
+                    assert await asyncio.to_thread(writer_entered.wait, 1), "failing writer was not reached"
+                    assert not dispatch.done(), "dispatch did not wait for the owned receipt barrier"
+                    dispatch.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await dispatch
+                    assert "111:10" in adapter._inflight_update_ids, "cancellation released a pending writer"
+
+                    real_stop = type(app).stop
+
+                    async def observed_stop(self, *args, **kwargs):
+                        if self is app:
+                            stop_entered.set()
+                        return await real_stop(self, *args, **kwargs)
+
+                    stop_patch.setattr(type(app), "stop", observed_stop)
+                    stop_task = asyncio.create_task(app.stop())
+                    await asyncio.wait_for(stop_entered.wait(), 1)
+                    assert not stop_task.done(), "stop returned before the known failure"
+                    release_writer.set()
+                    await asyncio.wait_for(stop_task, 2)
+                    assert effects == [], "callback ran after the pre-rename receipt failure"
+                    assert "111:10" not in adapter._seen_update_ids
+
+        # The failed writer is restored before this retry. Its failed write left no durable
+        # receipt, so the same update is admissible once.
+        async with connected(monkeypatch, is_reconnect=True) as (retry_adapter, retry_app, retry_delivered):
+            await retry_app.process_update(update(retry_app.bot))
+            await asyncio.gather(*retry_adapter._pending_text_batch_tasks.values())
+            assert [event.text for event in retry_delivered] == ["hello"]
+    finally:
+        release_writer.set()
+        reset_hermes_home_override(home_token)
+
+
+@pytest.mark.asyncio
+async def test_delayed_delivery_waits_for_durable_claim_before_held_queue(monkeypatch, tmp_path):
+    """A retryable delayed-delivery hold is downstream of the durable claim barrier."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.platforms.telegram import update_admission
+
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    real_writer = update_admission.atomic_json_write
+
+    def write_after_barrier(path, payload, **kwargs):
+        writer_entered.set()
+        assert release_writer.wait(2), "test did not release the isolated receipt writer"
+        real_writer(path, payload, **kwargs)
+
+    home_token = set_hermes_home_override(tmp_path)
+    try:
+        monkeypatch.setattr(update_admission, "atomic_json_write", write_after_barrier)
+        async with connected(monkeypatch) as (adapter, app, _):
+            monkeypatch.setattr(adapter, "_should_drop_delayed_delivery", lambda: True)
+            dispatch = asyncio.create_task(app.process_update(update(app.bot)))
+            assert await asyncio.to_thread(writer_entered.wait, 1), "durable writer was not reached"
+            assert adapter._held_inbound_events == [], "retryable hold happened before receipt persistence"
+            assert not dispatch.done(), "process_update returned before the durable claim settled"
+            release_writer.set()
+            await asyncio.wait_for(dispatch, 2)
+            assert len(adapter._held_inbound_events) == 1
+    finally:
+        release_writer.set()
+        reset_hermes_home_override(home_token)
+
+
+@pytest.mark.asyncio
+async def test_delayed_delivery_write_failure_skips_hold_and_readmits_redelivery(monkeypatch, tmp_path):
+    """A failed durable claim never becomes a retryable held delivery or a seen update."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.platforms.telegram import update_admission
+
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+
+    def fail_after_barrier(*args, **kwargs):
+        writer_entered.set()
+        assert release_writer.wait(2), "test did not release the isolated failing writer"
+        raise OSError("simulated receipt write failure before rename")
+
+    home_token = set_hermes_home_override(tmp_path)
+    try:
+        with monkeypatch.context() as failed_write:
+            failed_write.setattr(update_admission, "atomic_json_write", fail_after_barrier)
+            async with connected(monkeypatch) as (adapter, app, _):
+                monkeypatch.setattr(adapter, "_should_drop_delayed_delivery", lambda: True)
+                dispatch = asyncio.create_task(app.process_update(update(app.bot)))
+                assert await asyncio.to_thread(writer_entered.wait, 1), "failing writer was not reached"
+                assert adapter._held_inbound_events == [], "failed receipt write created a held delivery"
+                assert not dispatch.done(), "process_update returned before the known writer failure"
+                release_writer.set()
+                await asyncio.gather(dispatch, return_exceptions=True)
+                assert adapter._held_inbound_events == []
+                assert "111:10" not in adapter._seen_update_ids
+
+        # The failed writer is restored; the same update now follows the real core path once.
+        async with connected(monkeypatch, is_reconnect=True) as (retry_adapter, retry_app, retry_delivered):
+            await retry_app.process_update(update(retry_app.bot))
+            await asyncio.gather(*retry_adapter._pending_text_batch_tasks.values())
+            assert [event.text for event in retry_delivered] == ["hello"]
+    finally:
+        release_writer.set()
+        reset_hermes_home_override(home_token)
+
+
+@pytest.mark.asyncio
 async def test_connect_builds_concurrent_update_processor(monkeypatch):
     """The PTB Application must not run with the library default max_concurrent_updates=1:
     the update fetcher then awaits each update's full handler chain inline, so one slow
@@ -886,3 +1169,37 @@ async def test_slow_update_does_not_block_other_chats(monkeypatch):
         assert [e.source.chat_id for e in delivered][0] == "43"
         same_chat = "\n".join(e.text for e in delivered if e.source.chat_id == "42")
         assert same_chat == "hello\nsecond"
+
+
+@pytest.mark.asyncio
+async def test_late_teardown_salvage_on_retired_adapter_reaches_replacement(monkeypatch, tmp_path):
+    """Teardown of a rebuilt-away adapter can salvage an already accepted batch (#132829)."""
+    import json
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.platforms.telegram.update_admission import _Claim
+    from tests.gateway.test_telegram_text_batching import _make_adapter as make_pending_adapter, _make_event
+
+    home_token = set_hermes_home_override(tmp_path)
+    try:
+        async with connected(monkeypatch, bot_id=111) as (old, app, _):
+            old.handle_message = AsyncMock()
+            new = make_pending_adapter()
+            claim = _Claim("111:1", asyncio.current_task(), app)
+            token = old._update_admission.set(claim)
+            try:
+                await old._accept_update_durable()
+                old._mark_disconnected()
+                new.adopt_held_inbound(old)
+                old._pending_text_batches["k"] = _make_event("late-salvage")
+                await old._cancel_pending_delivery_tasks()
+                await new._held_inbound_redispatch_task
+                old.handle_message.assert_not_called()
+                assert [c.args[0].text for c in new.handle_message.call_args_list] == ["late-salvage"]
+                assert old._held_inbound_events == []
+                assert old._update_admission.get().accepted  # intent was persisted before this already accepted batch
+                receipt = json.loads((tmp_path / "telegram_update_receipts_111.json").read_text(encoding="utf-8"))
+                assert "1" in receipt["update_ids"]
+            finally:
+                old._update_admission.reset(token)
+    finally:
+        reset_hermes_home_override(home_token)

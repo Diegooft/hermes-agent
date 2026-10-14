@@ -47,10 +47,10 @@ class TelegramHeldInboundMixin:
             logger.warning(
                 "[Telegram] Discarding inbound under non-retryable fatal (%s, %d chars)", where, len(getattr(event, "text", None) or ""))
             return
+        self._require_durable_handoff_if_claimed()
         successor = getattr(self, "_held_inbound_successor", None)
         target = successor() if successor is not None else None
         if target is not None:  # retired by a runner rebuild (#132829)
-            self._accept_update()  # the claim being dispatched is ours, not the successor's
             target._adopt_held_event(event, where=f"{where}-forwarded", schedule=schedule)
             return
         held = getattr(self, "_held_inbound_events", None)
@@ -64,13 +64,18 @@ class TelegramHeldInboundMixin:
             logger.warning(
                 "[Telegram] Held-inbound queue full (%d); dropping oldest (%d chars)", max_n, len(getattr(dropped, "text", None) or ""))
         held.append(event)
-        self._accept_update()
         logger.warning(
             "[Telegram] Holding inbound (%s, %d chars, queue=%d)%s", where, len(getattr(event, "text", None) or ""), len(held),
             " - will redispatch on reconnect" if self._should_drop_delayed_delivery() else (" - scheduling redispatch" if schedule else ""))
         # A live-path hold must not orphan the event waiting for a reconnect that never comes.
         if schedule and not self._should_drop_delayed_delivery():
             self._schedule_held_inbound_redispatch()
+
+    def _require_durable_handoff_if_claimed(self) -> None:
+        admission = getattr(self, "_update_admission", None)
+        claim = admission.get() if admission is not None else None
+        if claim is not None and claim.receipt_state != "ACCEPTED_UNKNOWN_EFFECT":
+            raise RuntimeError("held inbound requires a durable receipt for the receiving claim")
 
     def adopt_held_inbound(self, predecessor: "TelegramHeldInboundMixin") -> None:
         """Take over the hold queue of the instance the runner just replaced with us (#132829): it only
