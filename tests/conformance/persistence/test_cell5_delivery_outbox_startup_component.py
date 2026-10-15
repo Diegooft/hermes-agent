@@ -210,7 +210,13 @@ async def _replay():
     runner.session_store = SessionStore(
         Path(os.environ["HERMES_HOME"]) / "sessions", GatewayConfig()
     )
-    runner.async_session_store = AsyncSessionStore(runner.session_store)
+    if RECEIVER_MODE == "gateway-runner-facade":
+        async_store = runner.async_session_store
+        assert isinstance(async_store, AsyncSessionStore)
+        assert async_store._store is runner.session_store
+        assert runner.async_session_store is async_store
+    else:
+        runner.async_session_store = AsyncSessionStore(runner.session_store)
     claimed = await runner._claim_pending_obligations()
     assert all(row.get("profile") == "default" for row in claimed)
     delivered = await runner._redeliver_claimed_obligations(claimed)
