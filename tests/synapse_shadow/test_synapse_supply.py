@@ -1,5 +1,5 @@
 import importlib.util, pathlib, unittest
-spec=importlib.util.spec_from_file_location('supply',pathlib.Path(__file__).with_name('synapse_supply.py'))
+spec=importlib.util.spec_from_file_location('supply',pathlib.Path(__file__).resolve().parents[2]/'scripts'/'synapse_shadow'/'synapse_supply.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class SupplyTest(unittest.TestCase):
  def test_next_eligible_and_dependency(self):

@@ -1,5 +1,5 @@
 import importlib.util, pathlib, unittest, tempfile, datetime, hashlib
-spec=importlib.util.spec_from_file_location('supply',pathlib.Path(__file__).with_name('synapse_supply.py'))
+spec=importlib.util.spec_from_file_location('supply',pathlib.Path(__file__).resolve().parents[2]/'scripts'/'synapse_shadow'/'synapse_supply.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 NOW=datetime.datetime(2026,10,16,12,0,tzinfo=datetime.timezone.utc)
 EPOCH=int(NOW.timestamp())
