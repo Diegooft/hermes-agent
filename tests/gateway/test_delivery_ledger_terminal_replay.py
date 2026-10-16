@@ -1,6 +1,7 @@
 """Terminal delivery obligations never reopen into another platform send."""
 
 import asyncio
+import os
 import threading
 from types import SimpleNamespace
 
@@ -113,6 +114,64 @@ def test_replaying_same_final_input_sends_once_through_real_caller(isolated_ledg
     assert replay.success
     assert replay.raw_response == {"ledger": "already_delivered"}
     assert replay_adapter is adapter
+    assert adapter.sends == 1
+    with ledger._connect() as conn:
+        assert conn.execute(
+            "SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)
+        ).fetchone() == ("delivered",)
+
+
+def test_concurrent_identical_final_calls_claim_one_delivery(isolated_ledger):
+    entered, release, second_done = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingTransport(_Transport):
+        async def send(self, **kwargs):
+            self.sends += 1
+            entered.set()
+            assert release.wait(10)
+            return SendResult(success=True, message_id="sent")
+
+    adapter = BlockingTransport()
+    source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="chat", thread_id=None)
+    event = SimpleNamespace(text="question", message_id="request", ledger_message_id=None, source=source)
+    args = (event, "session", "answer", {})
+    results = []
+
+    async def invoke_once():
+        result, _ = await adapter.send_final_ledgered(*args, reply_to=None)
+        return result
+
+    def invoke():
+        try:
+            results.append(asyncio.run(invoke_once()))
+        finally:
+            second_done.set()
+
+    first = threading.Thread(target=invoke)
+    first.start()
+    assert entered.wait(5)
+    second = threading.Thread(target=invoke)
+    second.start()
+    try:
+        assert second_done.wait(10), "concurrent replay did not finish while the first send was held"
+        assert not second.is_alive()
+
+        oid = ledger.compute_obligation_id("session", "request", "answer")
+        with ledger._connect() as conn:
+            assert conn.execute(
+                "SELECT state, owner_pid FROM delivery_obligations WHERE obligation_id=?", (oid,)
+            ).fetchone() == ("attempting", os.getpid())
+    finally:
+        release.set()
+    first.join(10)
+    second.join(10)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(results) == 2
+    assert sum(result.success for result in results) == 1
+    loser = next(result for result in results if not result.success)
+    assert loser.error == "DELIVERY_ATTEMPTING"
+    assert loser.raw_response == {"ledger": "attempting"}
     assert adapter.sends == 1
     with ledger._connect() as conn:
         assert conn.execute(
