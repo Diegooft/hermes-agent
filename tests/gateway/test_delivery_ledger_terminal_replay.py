@@ -98,6 +98,28 @@ def test_first_send_and_failed_retry_remain_sendable(isolated_ledger):
         assert conn.execute("SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone() == ("attempting",)
 
 
+def test_replaying_same_final_input_sends_once_through_real_caller(isolated_ledger):
+    adapter = _Transport()
+    source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="chat", thread_id=None)
+    event = SimpleNamespace(text="question", message_id="request", ledger_message_id=None, source=source)
+    args = (event, "session", "answer", {})
+
+    first, first_adapter = asyncio.run(adapter.send_final_ledgered(*args, reply_to=None))
+    replay, replay_adapter = asyncio.run(adapter.send_final_ledgered(*args, reply_to=None))
+
+    oid = ledger.compute_obligation_id("session", "request", "answer")
+    assert first.success
+    assert first_adapter is adapter
+    assert replay.success
+    assert replay.raw_response == {"ledger": "already_delivered"}
+    assert replay_adapter is adapter
+    assert adapter.sends == 1
+    with ledger._connect() as conn:
+        assert conn.execute(
+            "SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)
+        ).fetchone() == ("delivered",)
+
+
 @pytest.mark.parametrize("terminal", ["delivered", "abandoned"])
 def test_terminalized_after_observation_never_reaches_transport(isolated_ledger, monkeypatch, terminal):
     adapter = _Transport()
