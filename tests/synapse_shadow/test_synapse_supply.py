@@ -1,4 +1,4 @@
-import contextlib, importlib.util, io, json, pathlib, tempfile, unittest
+import contextlib, hashlib, importlib.util, io, json, pathlib, subprocess, tempfile, unittest
 from unittest import mock
 spec=importlib.util.spec_from_file_location('supply',pathlib.Path(__file__).resolve().parents[2]/'scripts'/'synapse_shadow'/'synapse_supply.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
@@ -73,4 +73,39 @@ class SupplyTest(unittest.TestCase):
    self.assertIn('b'*64,native.call_args.args[1])
    receipt=json.loads(next((home/'state'/'synapse-supply').glob('*.json')).read_text(encoding='utf-8'))
    self.assertEqual(receipt['source_provenance'],provenance)
+ def test_test_card_binds_its_embedded_fixture_to_the_script_blob(self):
+  with tempfile.TemporaryDirectory() as raw_home:
+   home=pathlib.Path(raw_home)
+   runtime_home=home/'runtime';runtime_home.mkdir()
+   (runtime_home/'continuity.yaml').write_text('supply:\n  board: fixtures\n  low_watermark: 10\n',encoding='utf-8')
+   (runtime_home/'state'/'synapse-supply').mkdir(parents=True)
+   hermes_repo=home/'hermes';script=hermes_repo/'scripts'/'synapse_shadow'/'synapse_supply.py';script.parent.mkdir(parents=True)
+   script_bytes=b'embedded C05.2 test-card fixture source\n';script.write_bytes(script_bytes)
+   subprocess.run(['git','init','--quiet',str(hermes_repo)],check=True)
+   subprocess.run(['git','-C',str(hermes_repo),'config','user.name','Hermes test'],check=True)
+   subprocess.run(['git','-C',str(hermes_repo),'config','user.email','hermes-test@example.invalid'],check=True)
+   subprocess.run(['git','-C',str(hermes_repo),'add','--','scripts/synapse_shadow/synapse_supply.py'],check=True)
+   subprocess.run(['git','-C',str(hermes_repo),'commit','--quiet','-m','fixture'],check=True)
+   head=subprocess.check_output(['git','-C',str(hermes_repo),'rev-parse','HEAD'],text=True).strip()
+   expected_sha=hashlib.sha256(script_bytes).hexdigest()
+   native=mock.Mock(return_value={'id':'test-card-1','status':'triage'})
+   output=io.StringIO()
+   with mock.patch.multiple(
+    m,
+    HOME=runtime_home,
+    REPO=home/'synapse-root',
+    lock=mock.Mock(side_effect=lambda _:contextlib.nullcontext()),
+    snapshot=mock.Mock(return_value=([],{'teste':[]})),
+    open_prs=mock.Mock(return_value=[]),
+    native=native,
+   ), mock.patch.object(m,'__file__',str(script)), mock.patch('sys.argv',['synapse_supply.py','--test-card']), contextlib.redirect_stdout(output):
+    m.main()
+   self.assertIn(expected_sha,native.call_args.args[1])
+   receipt=json.loads(next((runtime_home/'state'/'synapse-supply').glob('*.json')).read_text(encoding='utf-8'))
+   provenance=receipt['source_provenance']
+   self.assertEqual(provenance['revision'],head)
+   self.assertEqual(provenance['inputs'][0]['commit'],head)
+   self.assertEqual(provenance['inputs'][0]['sha256'],expected_sha)
+   self.assertEqual(pathlib.Path(provenance['inputs'][0]['repository_root']),hermes_repo.resolve())
+   m.verify_source_provenance(provenance)
 if __name__=='__main__':unittest.main()

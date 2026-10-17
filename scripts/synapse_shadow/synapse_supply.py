@@ -52,6 +52,13 @@ def read_pinned(path):
  if not raw.strip(): raise Refusal('FONTE_VAZIA','INFRA',{'caminho':str(path),'bytes':len(raw)})
  return raw,hashlib.sha256(raw).hexdigest()
 
+def repository_root(path):
+ source=pathlib.Path(path).resolve()
+ try:result=subprocess.run(['git','-C',str(source.parent),'rev-parse','--show-toplevel'],capture_output=True,check=False,timeout=10)
+ except subprocess.TimeoutExpired:raise Refusal('REVISAO_INDISPONIVEL','INFRA',{'caminho':str(source),'erro':'git root timeout'})
+ if result.returncode:raise Refusal('REVISAO_INDISPONIVEL','INFRA',{'caminho':str(source),'erro':'git root'})
+ return pathlib.Path(result.stdout.decode('utf-8').strip()).resolve()
+
 def read_versioned(path,repo=None):
  root=pathlib.Path(REPO if repo is None else repo).resolve()
  try:resolved=pathlib.Path(path).resolve(strict=True);rel=resolved.relative_to(root).as_posix()
@@ -170,7 +177,8 @@ def verify_source_provenance(provenance):
   raise Refusal('PROVENIENCIA_AUSENTE','INFRA',{})
  for item in provenance['inputs']:
   if item.get('source_kind')=='git_blob':
-   _,current=read_versioned(pathlib.Path(REPO)/item['path'])
+   source_repo=pathlib.Path(item.get('repository_root') or REPO).resolve()
+   _,current=read_versioned(source_repo/item['path'],repo=source_repo)
    if current['commit']!=item.get('commit') or current['sha256']!=item.get('sha256'):
     raise Refusal('FONTE_MUTADA','INFRA',{'caminho':item.get('path'),'esperado':item.get('sha256'),'atual':current['sha256']})
   elif item.get('source_kind')=='runtime_owner_file':
@@ -237,7 +245,18 @@ def main():
   if not args.test_card and backlog_count(boards[board])>=int(cfg['low_watermark']):
    print(json.dumps({'status':'stock_sufficient','board':board,'backlog':backlog_count(boards[board])}));return
   prs=open_prs()
-  choices=[('owner','SUPPLY-SMOKE-20261007',{'name':'Teste supply — apenas validar referência, sem implementação','state':'TODO','files':[],'acceptance':['Criar um card Triage idempotente; não alterar código nem publicar PR.']},'Diego: Plano1.2 item02')] if args.test_card else candidates()
+  if args.test_card:
+   source='Diego: Plano1.2 item02'
+   script_path=pathlib.Path(__file__).resolve()
+   script_repo=repository_root(script_path)
+   _,script_ref=read_versioned(script_path,repo=script_repo)
+   script_ref['repository_root']=str(script_repo)
+   provenance={'revision':script_ref['commit'],'inputs':[script_ref]}
+   SOURCE_PROVENANCE_BY_SOURCE.clear()
+   SOURCE_PROVENANCE_BY_SOURCE[source]=provenance
+   choices=[('owner','SUPPLY-SMOKE-20261007',{'name':'Teste supply — apenas validar referência, sem implementação','state':'TODO','files':[],'acceptance':['Criar um card Triage idempotente; não alterar código nem publicar PR.']},source)]
+  else:
+   choices=candidates()
   for program,key,node,source in choices:
    if duplicate(program,key,node,all_cards,prs):continue
    provenance=SOURCE_PROVENANCE_BY_SOURCE.get(source)
