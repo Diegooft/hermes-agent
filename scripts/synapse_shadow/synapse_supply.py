@@ -1,6 +1,6 @@
 """Canonical plans -> native Triage. No model, alternate queue, or graph mutation."""
 import argparse, contextlib, datetime, hashlib, json, os, pathlib, re, sqlite3, subprocess
-import yaml
+import hermes_yaml as yaml
 
 HOME=pathlib.Path(os.environ.get('HERMES_HOME','C:/dev/hermes/synapse-shadow'))
 REPO=pathlib.Path('C:/dev/ecosystem')
@@ -177,7 +177,8 @@ def main():
  config=yaml.safe_load((HOME/'continuity.yaml').read_text(encoding='utf-8-sig'));cfg=config['supply']
  if (HOME/'ESTOP').exists():print(json.dumps({'status':'held','reason':'native ESTOP'}));return
  state=HOME/'state/synapse-supply'
- with lock(state/'supply.lock'):
+ guard=contextlib.nullcontext() if args.dry_run else lock(state/'supply.lock')
+ with guard:
   all_cards,boards=snapshot()
   board='teste' if args.test_card else cfg['board']
   if board not in boards:raise RuntimeError('Configured native board missing')

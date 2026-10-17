@@ -1,4 +1,5 @@
-import importlib.util, pathlib, unittest
+import contextlib, importlib.util, io, pathlib, tempfile, unittest
+from unittest import mock
 spec=importlib.util.spec_from_file_location('supply',pathlib.Path(__file__).resolve().parents[2]/'scripts'/'synapse_shadow'/'synapse_supply.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class SupplyTest(unittest.TestCase):
@@ -27,4 +28,21 @@ class SupplyTest(unittest.TestCase):
  def test_same_source_stable_identity(self):
   self.assertEqual(m.identity('growth','G-1'),m.identity('growth','G-1'))
   self.assertNotEqual(m.identity('growth','G-1'),m.identity('voz','G-1'))
+ def test_dry_run_does_not_create_supply_lock(self):
+  with tempfile.TemporaryDirectory() as raw_home:
+   home=pathlib.Path(raw_home)
+   (home/'continuity.yaml').write_text('supply:\n  board: fixtures\n  low_watermark: 10\n',encoding='utf-8')
+   output=io.StringIO()
+   with mock.patch.multiple(
+    m,
+    HOME=home,
+    PINS={},
+    snapshot=mock.Mock(return_value=([],{'fixtures':[]})),
+    open_prs=mock.Mock(return_value=[]),
+    candidates=mock.Mock(return_value=iter([('program','NODE-1',{'name':'Candidate'},'fixture.yaml')])),
+    native=mock.Mock(side_effect=AssertionError('dry-run must not write native cards')),
+   ), mock.patch('sys.argv',['synapse_supply.py','--dry-run']), contextlib.redirect_stdout(output):
+    m.main()
+   self.assertIn('candidate',output.getvalue())
+   self.assertFalse((home/'state'/'synapse-supply').exists())
 if __name__=='__main__':unittest.main()
