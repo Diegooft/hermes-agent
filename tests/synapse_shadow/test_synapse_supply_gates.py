@@ -1,4 +1,5 @@
-import importlib.util, pathlib, unittest, tempfile, datetime, hashlib
+import importlib.util, pathlib, unittest, tempfile, datetime, hashlib, subprocess
+from unittest import mock
 spec=importlib.util.spec_from_file_location('supply',pathlib.Path(__file__).resolve().parents[2]/'scripts'/'synapse_shadow'/'synapse_supply.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 NOW=datetime.datetime(2026,10,16,12,0,tzinfo=datetime.timezone.utc)
@@ -47,7 +48,9 @@ class ClaimLiveness(unittest.TestCase):
   self.assertEqual(len(m.stale_claims([card(),card(claim_expires=EPOCH-5)],NOW)),1)
 
 class SourceGates(unittest.TestCase):
- def setUp(self): self.d=pathlib.Path(tempfile.mkdtemp())
+ def setUp(self):
+  self._temp=tempfile.TemporaryDirectory();self.d=pathlib.Path(self._temp.name)
+ def tearDown(self): self._temp.cleanup()
  def test_pinned_read_and_verify_ok(self):
   p=self.d/'g.yaml';p.write_bytes(b'nodes: {}\n')
   data,sha=m.read_pinned(p)
@@ -65,6 +68,11 @@ class SourceGates(unittest.TestCase):
   with self.assertRaises(m.Refusal) as c: m.read_pinned(self.d/'nao-existe.yaml')
   self.assertEqual((c.exception.code,c.exception.klass),('FONTE_INDISPONIVEL','INFRA'))
   self.assertIn('caminho',c.exception.measured)
+ def test_git_source_timeout_is_a_named_infrastructure_refusal(self):
+  p=self.d/'g.yaml';p.write_bytes(b'nodes: {}\n')
+  with mock.patch.object(m.subprocess,'run',side_effect=subprocess.TimeoutExpired('git',10)):
+   with self.assertRaises(m.Refusal) as c:m.read_versioned(p,repo=self.d)
+  self.assertEqual((c.exception.code,c.exception.klass),('REVISAO_INDISPONIVEL','INFRA'))
  def test_empty_source_is_refusal_not_nothing_to_do(self):
   p=self.d/'e.yaml';p.write_bytes(b'')
   with self.assertRaises(m.Refusal) as c: m.read_pinned(p)
@@ -72,4 +80,20 @@ class SourceGates(unittest.TestCase):
  def test_refusal_record_is_dict_with_class(self):
   r=m.Refusal('FONTE_INDISPONIVEL','INFRA',{'caminho':'x'}).record()
   self.assertEqual((r['status'],r['codigo'],r['classe']),('refused','FONTE_INDISPONIVEL','INFRA'))
+ def test_dirty_tracked_graph_cannot_change_eligibility(self):
+  repo=self.d/'repo';gov=repo/'governance';gov.mkdir(parents=True)
+  (gov/'programs.yaml').write_text('programs:\n  fixture:\n    status: active\n    graph: governance/graph.yaml\n',encoding='utf-8')
+  graph=gov/'graph.yaml'
+  graph.write_text('nodes:\n  PARENT:\n    state: IN_PROGRESS\n  CHILD:\n    state: BLOCKED_BY_DEPENDENCY\n    depends_on: [PARENT]\n',encoding='utf-8')
+  subprocess.run(['git','init','-q'],cwd=repo,check=True,capture_output=True)
+  subprocess.run(['git','config','user.name','C05 test'],cwd=repo,check=True,capture_output=True)
+  subprocess.run(['git','config','user.email','c05-test@example.invalid'],cwd=repo,check=True,capture_output=True)
+  subprocess.run(['git','add','governance/programs.yaml','governance/graph.yaml'],cwd=repo,check=True,capture_output=True)
+  subprocess.run(['git','commit','-q','-m','fixture'],cwd=repo,check=True,capture_output=True)
+  with mock.patch.object(m,'REPO',repo),mock.patch.object(m,'HOME',self.d/'empty-home'),mock.patch.object(m,'SOURCE_PROVENANCE_BY_SOURCE',{}):
+   self.assertEqual(list(m.candidates()),[])
+  graph.write_text('nodes:\n  PARENT:\n    state: DONE\n  CHILD:\n    state: TODO\n    depends_on: [PARENT]\n',encoding='utf-8')
+  with mock.patch.object(m,'REPO',repo),mock.patch.object(m,'HOME',self.d/'empty-home'),mock.patch.object(m,'SOURCE_PROVENANCE_BY_SOURCE',{}):
+   with self.assertRaises(m.Refusal) as c:list(m.candidates())
+  self.assertIn(c.exception.code,{'CHECKOUT_SUJO','FONTE_MUTADA'})
 if __name__=='__main__':unittest.main()

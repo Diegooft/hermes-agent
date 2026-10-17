@@ -5,7 +5,7 @@ import hermes_yaml as yaml
 HOME=pathlib.Path(os.environ.get('HERMES_HOME','C:/dev/hermes/synapse-shadow'))
 REPO=pathlib.Path('C:/dev/ecosystem')
 ACTIVE={'triage','todo','ready','scheduled'}
-DONE={'DONE','LANDED_IN_STAGING','CERTIFIED'}
+DONE={'DONE','LANDED_IN_STAGING'}
 
 def identity(program,node): return 'synapse-supply:'+program+':'+node
 def backlog_count(cards): return sum(c.get('status') in ACTIVE for c in cards)
@@ -51,6 +51,33 @@ def read_pinned(path):
  except OSError as e: raise Refusal('FONTE_INDISPONIVEL','INFRA',{'caminho':str(path),'erro':type(e).__name__})
  if not raw.strip(): raise Refusal('FONTE_VAZIA','INFRA',{'caminho':str(path),'bytes':len(raw)})
  return raw,hashlib.sha256(raw).hexdigest()
+
+def read_versioned(path,repo=None):
+ root=pathlib.Path(REPO if repo is None else repo).resolve()
+ try:resolved=pathlib.Path(path).resolve(strict=True);rel=resolved.relative_to(root).as_posix()
+ except (OSError,ValueError) as e:raise Refusal('FONTE_INDISPONIVEL','INFRA',{'caminho':str(path),'erro':type(e).__name__})
+ def git(*args):
+  try:return subprocess.run(['git','-C',str(root),*args],capture_output=True,check=False,timeout=10)
+  except subprocess.TimeoutExpired:raise Refusal('REVISAO_INDISPONIVEL','INFRA',{'caminho':str(path),'erro':'git timeout'})
+ tracked=git('ls-files','--error-unmatch','--',rel)
+ if tracked.returncode:raise Refusal('FONTE_NAO_VERSIONADA','INFRA',{'caminho':rel})
+ dirty=git('status','--porcelain','--untracked-files=all','--',rel)
+ if dirty.returncode:raise Refusal('REVISAO_INDISPONIVEL','INFRA',{'caminho':rel,'erro':'git status'})
+ if dirty.stdout.strip():raise Refusal('CHECKOUT_SUJO','INFRA',{'caminho':rel,'status':dirty.stdout.decode('utf-8','replace').strip()})
+ revision=git('rev-parse','HEAD')
+ if revision.returncode:raise Refusal('REVISAO_INDISPONIVEL','INFRA',{'caminho':rel,'erro':'git rev-parse'})
+ commit=revision.stdout.decode('ascii').strip()
+ blob=git('show',f'HEAD:{rel}')
+ if blob.returncode:raise Refusal('FONTE_INDISPONIVEL','INFRA',{'caminho':rel,'erro':'git show'})
+ raw=blob.stdout
+ after=git('status','--porcelain','--untracked-files=all','--',rel)
+ final_revision=git('rev-parse','HEAD')
+ if after.returncode or final_revision.returncode:raise Refusal('REVISAO_INDISPONIVEL','INFRA',{'caminho':rel,'erro':'revalidacao git'})
+ if after.stdout.strip():raise Refusal('CHECKOUT_SUJO','INFRA',{'caminho':rel,'status':after.stdout.decode('utf-8','replace').strip()})
+ if final_revision.stdout.decode('ascii').strip()!=commit:raise Refusal('REVISAO_MUDOU','INFRA',{'caminho':rel,'revisao_inicial':commit,'revisao_final':final_revision.stdout.decode('ascii').strip()})
+ expected=hashlib.sha256(raw).hexdigest()
+ if not raw.strip():raise Refusal('FONTE_VAZIA','INFRA',{'caminho':rel,'bytes':len(raw)})
+ return raw,{'source_kind':'git_blob','path':rel,'commit':commit,'sha256':expected}
 
 def verify_pinned(path,expected):
  _,now_sha=read_pinned(path)
@@ -119,12 +146,15 @@ def native(args,body=None):
  return json.loads(result.stdout)
 
 def body_for(program,key,node,source):
+ provenance=SOURCE_PROVENANCE_BY_SOURCE.get(source)
+ if provenance is None:raise Refusal('PROVENIENCIA_AUSENTE','INFRA',{'source':str(source)})
  paths=node.get('files',node.get('paths',[]))
  if not isinstance(paths,list):paths=[]
  return '\n'.join(['fonte: '+program+':'+key, 'fonte_arquivo: '+source,
   'Objetivo: '+str(node.get('name',key)), 'Dependências: '+json.dumps(node.get('depends_on',[])),
   'Arquivos autorizados explicitamente no nó: '+json.dumps(paths,ensure_ascii=False),
   'Aceites canônicos: '+json.dumps(node.get('acceptance',[]),ensure_ascii=False),
+  'Proveniência da fonte: '+json.dumps(provenance,ensure_ascii=False,sort_keys=True),
   'Escopo limitado à fonte. Se faltarem arquivos/decisão/autonomia, bloquear e pedir informação; nunca inventar.',
   'Contrato inicial local-only: publicação/integração requer autorização nativa explícita no card.'])
 
@@ -133,31 +163,53 @@ def source_path(value):
  if not path.is_relative_to(REPO.resolve()) or not path.is_file():raise ValueError('Invalid canonical source path')
  return path
 
-PINS={}  # caminho -> sha256 lido; reverificado antes de criar o card (fonte imutavel entre leitura e uso)
+SOURCE_PROVENANCE_BY_SOURCE={}
+
+def verify_source_provenance(provenance):
+ if not isinstance(provenance,dict) or not isinstance(provenance.get('inputs'),list) or not provenance['inputs']:
+  raise Refusal('PROVENIENCIA_AUSENTE','INFRA',{})
+ for item in provenance['inputs']:
+  if item.get('source_kind')=='git_blob':
+   _,current=read_versioned(pathlib.Path(REPO)/item['path'])
+   if current['commit']!=item.get('commit') or current['sha256']!=item.get('sha256'):
+    raise Refusal('FONTE_MUTADA','INFRA',{'caminho':item.get('path'),'esperado':item.get('sha256'),'atual':current['sha256']})
+  elif item.get('source_kind')=='runtime_owner_file':
+   _,current=read_pinned(pathlib.Path(item['path']))
+   if current!=item.get('sha256'):raise Refusal('FONTE_MUTADA','INFRA',{'caminho':item.get('path'),'esperado':item.get('sha256'),'atual':current})
+  else:raise Refusal('PROVENIENCIA_INVALIDA','INFRA',{'tipo':item.get('source_kind')})
 
 def candidates():
- registry=yaml.safe_load((REPO/'governance/programs.yaml').read_text(encoding='utf-8-sig'))
+ SOURCE_PROVENANCE_BY_SOURCE.clear()
+ registry_path=REPO/'governance/programs.yaml'
+ registry_raw,registry_ref=read_versioned(registry_path)
+ registry=yaml.safe_load(registry_raw.decode('utf-8-sig'))
  programs=registry.get('programs')
  if not isinstance(programs,dict):raise ValueError('Invalid program registry')
  for program,data in programs.items():
   if not isinstance(data,dict) or data.get('status')!='active' or not data.get('graph'):continue
   try:source=source_path(data['graph'])
   except ValueError:raise Refusal('FONTE_INDISPONIVEL','INFRA',{'programa':program,'graph':str(data['graph'])})
-  raw,sha=read_pinned(source);PINS[source]=sha
+  raw,graph_ref=read_versioned(source)
   graph=yaml.safe_load(raw.decode('utf-8-sig'))
   decisions=None
+  inputs=[registry_ref,graph_ref]
   if data.get('decisions'):
-   dpath=REPO/str(data['decisions']);draw,dsha=read_pinned(dpath);PINS[dpath]=dsha
+   dpath=source_path(data['decisions']);draw,decision_ref=read_versioned(dpath);inputs.append(decision_ref)
    decisions=yaml.safe_load(draw.decode('utf-8-sig'))
-  for key,node in eligible(graph,decisions):yield program,key,node,str(source.relative_to(REPO))
+  source_name=str(source.relative_to(REPO)).replace('\\','/')
+  SOURCE_PROVENANCE_BY_SOURCE[source_name]={'revision':registry_ref['commit'],'inputs':inputs}
+  for key,node in eligible(graph,decisions):yield program,key,node,source_name
  # Owner input is a short Markdown file, one fenced YAML mapping per objective.
  owner=HOME/'missions/objetivos.md'
  if owner.exists():
-  for raw in re.findall(r'```yaml\s*\n(.*?)```',owner.read_text(encoding='utf-8-sig'),re.S):
+  owner_raw,owner_sha=read_pinned(owner);owner_text=owner_raw.decode('utf-8-sig')
+  owner_source=str(owner)
+  SOURCE_PROVENANCE_BY_SOURCE[owner_source]={'revision':None,'inputs':[{'source_kind':'runtime_owner_file','path':owner_source,'sha256':owner_sha}]}
+  for raw in re.findall(r'```yaml\s*\n(.*?)```',owner_text,re.S):
    node=yaml.safe_load(raw)
    if not isinstance(node,dict) or not isinstance(node.get('id'),str):raise ValueError('Owner objective requires explicit id')
    if not node.get('files') or not node.get('acceptance'):raise ValueError('Owner objective requires files and acceptance')
-   for key,obj in eligible({'nodes':{node['id']:node}}):yield 'owner',key,obj,str(owner)
+   for key,obj in eligible({'nodes':{node['id']:node}}):yield 'owner',key,obj,owner_source
 
 @contextlib.contextmanager
 def lock(path):
@@ -188,11 +240,12 @@ def main():
   choices=[('owner','SUPPLY-SMOKE-20261007',{'name':'Teste supply — apenas validar referência, sem implementação','state':'TODO','files':[],'acceptance':['Criar um card Triage idempotente; não alterar código nem publicar PR.']},'Diego: Plano1.2 item02')] if args.test_card else candidates()
   for program,key,node,source in choices:
    if duplicate(program,key,node,all_cards,prs):continue
-   for pinned,sha in list(PINS.items()):verify_pinned(pinned,sha)
+   provenance=SOURCE_PROVENANCE_BY_SOURCE.get(source)
+   verify_source_provenance(provenance)
    if args.dry_run:print(json.dumps({'status':'candidate','source':program+':'+key,'board':board}));return
    card=native(['--board',board,'create',str(node.get('name',key))[:160], '--body-file','-', '--triage','--idempotency-key',identity(program,key),'--created-by','synapse-supply','--workspace','scratch','--completion-contract','local-only','--json'],body_for(program,key,node,source))
    if not isinstance(card,dict) or not card.get('id'):raise RuntimeError('Native card receipt missing')
-   record={'status':'em fila','source':program+':'+key,'source_file':source,'board':board,'card_id':card['id'],'native_status':card.get('status'),'at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+   record={'status':'em fila','source':program+':'+key,'source_file':source,'source_provenance':provenance,'board':board,'card_id':card['id'],'native_status':card.get('status'),'at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
    # Derived receipt only. Canonical graph and native card remain the authorities.
    target=state/(hashlib.sha256(identity(program,key).encode()).hexdigest()+'.json')
    temp=target.with_suffix('.tmp');temp.write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8');os.replace(temp,target)
