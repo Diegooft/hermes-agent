@@ -258,11 +258,22 @@ def main():
   else:
    choices=candidates()
   for program,key,node,source in choices:
-   if duplicate(program,key,node,all_cards,prs):continue
-   provenance=SOURCE_PROVENANCE_BY_SOURCE.get(source)
-   verify_source_provenance(provenance)
+   recovered=False;card=None
+   if duplicate(program,key,node,all_cards,prs):
+    token=identity(program,key)
+    provenance=SOURCE_PROVENANCE_BY_SOURCE.get(source)
+    verify_source_provenance(provenance)
+    body=body_for(program,key,node,source)
+    matches=[item for item in all_cards if item.get('idempotency_key')==token and item.get('id') and item.get('body')==body]
+    if len(matches)!=1:continue
+    card=matches[0];recovered=True
+   if not recovered:
+    provenance=SOURCE_PROVENANCE_BY_SOURCE.get(source)
+    verify_source_provenance(provenance)
+    body=body_for(program,key,node,source)
    if args.dry_run:print(json.dumps({'status':'candidate','source':program+':'+key,'board':board}));return
-   card=native(['--board',board,'create',str(node.get('name',key))[:160], '--body-file','-', '--triage','--idempotency-key',identity(program,key),'--created-by','synapse-supply','--workspace','scratch','--completion-contract','local-only','--json'],body_for(program,key,node,source))
+   if not recovered:
+    card=native(['--board',board,'create',str(node.get('name',key))[:160], '--body-file','-', '--triage','--idempotency-key',identity(program,key),'--created-by','synapse-supply','--workspace','scratch','--completion-contract','local-only','--json'],body)
    if not isinstance(card,dict) or not card.get('id'):raise RuntimeError('Native card receipt missing')
    record={'status':'em fila','source':program+':'+key,'source_file':source,'source_provenance':provenance,'board':board,'card_id':card['id'],'native_status':card.get('status'),'at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
    # Derived receipt only. Canonical graph and native card remain the authorities.
