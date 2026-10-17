@@ -6,6 +6,7 @@ uv.lock text eol=lf
 # Without this, Windows checkout converts to CRLF and breaks `exec` in the
 # container entrypoint with "no such file or directory".
 *.sh        text eol=lf
+scripts/run-in-hermes-env text eol=lf
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
