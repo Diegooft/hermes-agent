@@ -2,11 +2,12 @@
 
 This fixture measures the real Hermes delivery-ledger checkpoints through the
 production startup and authorization mixins against a local fsync journal.  It
-is component evidence only: it does not instantiate the GatewayRunner facade,
-run the native startup sequence, or measure the original Cell5
-SIGKILL path.  An ``attempting`` row whose journaled effect precedes the crash
-is an explicit at-least-once counterexample: replay adds a visibly marked
-second effect; that outcome is never treated as exactly-once acceptance.
+covers both the test-only component receiver and an allocated GatewayRunner
+facade receiver created with ``object.__new__``: it never calls the facade
+constructor, native startup, connect, provider, or the original Cell5 SIGKILL
+path.  An ``attempting`` row whose journaled effect precedes the crash is an
+explicit at-least-once counterexample: replay adds a visibly marked second
+effect; that outcome is never treated as exactly-once acceptance.
 """
 
 from __future__ import annotations
@@ -30,6 +31,9 @@ REPO_ROOT = _CWD if (_CWD / "gateway").is_dir() else Path(__file__).resolve().pa
 CHILD_DEADLINE_SECONDS = 30
 CONTENT = "reply"
 RESULT_PREFIX = "C14_RESULT="
+RECEIVER_COMPONENT = "startup-replay-component"
+RECEIVER_FACADE = "gateway-runner-facade"
+RECEIVER_MODES = (RECEIVER_COMPONENT, RECEIVER_FACADE)
 
 
 CHILD = r'''
@@ -51,6 +55,7 @@ ROOT = Path(os.environ["C14_ROOT"])
 JOURNAL = ROOT / "journal.jsonl"
 IDS = ROOT / "ids.json"
 ROLE = os.environ["C14_ROLE"]
+RECEIVER_MODE = os.environ["C14_RECEIVER_MODE"]
 CONTENT = "reply"
 SESSION_KEY = "agent:main:telegram:dm:c14-offline"
 CHAT_ID = "4242"
@@ -77,6 +82,21 @@ for _target_name in (
     assert getattr(StartupReplayComponent, _target_name) is getattr(
         GatewayStartupMixin, _target_name
     )
+
+
+def _replay_receiver_class():
+    if RECEIVER_MODE == "startup-replay-component":
+        return StartupReplayComponent
+    if RECEIVER_MODE == "gateway-runner-facade":
+        # Importing the facade is deliberately restricted to the isolated child
+        # and this explicit mode. Construction/start/connect/provider paths stay
+        # outside the fixture; _replay uses object.__new__ below.
+        from gateway.run import GatewayRunner
+
+        assert GatewayAuthorizationMixin in GatewayRunner.__mro__
+        assert GatewayStartupMixin in GatewayRunner.__mro__
+        return GatewayRunner
+    raise AssertionError(f"unexpected C14 receiver mode: {RECEIVER_MODE!r}")
 
 
 def _watchdog():
@@ -184,13 +204,19 @@ async def _seed_delivered_control():
 
 async def _replay():
     adapter = JournalAdapter()
-    runner = object.__new__(StartupReplayComponent)
+    runner = object.__new__(_replay_receiver_class())
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._profile_adapters = {}
     runner.session_store = SessionStore(
         Path(os.environ["HERMES_HOME"]) / "sessions", GatewayConfig()
     )
-    runner.async_session_store = AsyncSessionStore(runner.session_store)
+    if RECEIVER_MODE == "gateway-runner-facade":
+        async_store = runner.async_session_store
+        assert isinstance(async_store, AsyncSessionStore)
+        assert async_store._store is runner.session_store
+        assert runner.async_session_store is async_store
+    else:
+        runner.async_session_store = AsyncSessionStore(runner.session_store)
     claimed = await runner._claim_pending_obligations()
     assert all(row.get("profile") == "default" for row in claimed)
     delivered = await runner._redeliver_claimed_obligations(claimed)
@@ -220,7 +246,8 @@ else:
 '''
 
 
-def _fixture_env(root: Path, role: str) -> dict[str, str]:
+def _fixture_env(root: Path, role: str, receiver_mode: str) -> dict[str, str]:
+    assert receiver_mode in RECEIVER_MODES
     home = root / "home"
     hermes_home = root / "isolated-hermes"
     temp_dir = root / "tmp"
@@ -257,16 +284,19 @@ def _fixture_env(root: Path, role: str) -> dict[str, str]:
             "TEMP": str(temp_dir),
             "C14_ROOT": str(root),
             "C14_ROLE": role,
+            "C14_RECEIVER_MODE": receiver_mode,
         }
     )
     return env
 
 
-def _run_child(root: Path, role: str, expected_rc: int) -> tuple[str, str]:
+def _run_child(
+    root: Path, role: str, expected_rc: int, receiver_mode: str
+) -> tuple[str, str]:
     child = subprocess.Popen(
         [sys.executable, "-c", CHILD],
         cwd=str(REPO_ROOT),
-        env=_fixture_env(root, role),
+        env=_fixture_env(root, role, receiver_mode),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -315,8 +345,10 @@ def _ids(root: Path) -> dict:
     return json.loads((root / "ids.json").read_text(encoding="utf-8"))
 
 
-def _replay_twice_and_assert_noop(root: Path, oid: str, expected_first: list[str]) -> dict:
-    first_stdout, _ = _run_child(root, "replay", 0)
+def _replay_twice_and_assert_noop(
+    root: Path, oid: str, expected_first: list[str], receiver_mode: str
+) -> dict:
+    first_stdout, _ = _run_child(root, "replay", 0, receiver_mode)
     first = _result(first_stdout)
     assert first == {"claimed": [oid], "delivered": 1}
     assert _journal(root) == expected_first
@@ -324,38 +356,48 @@ def _replay_twice_and_assert_noop(root: Path, oid: str, expected_first: list[str
     assert set(first_ledger) == {oid}
     assert first_ledger[oid][0] == "delivered"
 
-    second_stdout, _ = _run_child(root, "replay", 0)
+    second_stdout, _ = _run_child(root, "replay", 0, receiver_mode)
     second = _result(second_stdout)
     assert second == {"claimed": [], "delivered": 0}
     assert _journal(root) == expected_first
     assert _ledger(root) == first_ledger
     return first
 
+@pytest.fixture(params=RECEIVER_MODES, ids=("startup-component", "gateway-runner-facade"))
+def receiver_mode(request: pytest.FixtureRequest) -> str:
+    return request.param
 
-def test_confirmed_unsent_pending_replays_plain_once_then_is_noop(tmp_path: Path):
-    _run_child(tmp_path, "seed-pending", 137)
+
+def test_confirmed_unsent_pending_replays_plain_once_then_is_noop(
+    tmp_path: Path, receiver_mode: str
+):
+    _run_child(tmp_path, "seed-pending", 137, receiver_mode)
     ids = _ids(tmp_path)
     assert ids["scenario"] == "pending-before-effect"
     assert _journal(tmp_path) == []
     oid = ids["obligation_id"]
     assert _ledger(tmp_path) == {oid: ("pending", 0)}
-    _replay_twice_and_assert_noop(tmp_path, oid, [CONTENT])
+    _replay_twice_and_assert_noop(tmp_path, oid, [CONTENT], receiver_mode)
 
 
-def test_effect_before_receipt_is_marked_at_least_once_counterexample(tmp_path: Path):
-    _run_child(tmp_path, "seed-attempting", 137)
+def test_effect_before_receipt_is_marked_at_least_once_counterexample(
+    tmp_path: Path, receiver_mode: str
+):
+    _run_child(tmp_path, "seed-attempting", 137, receiver_mode)
     ids = _ids(tmp_path)
     assert ids["scenario"] == "attempting-after-effect"
     assert _journal(tmp_path) == [CONTENT]
     oid = ids["obligation_id"]
     assert _ledger(tmp_path) == {oid: ("attempting", 0)}
     expected = [CONTENT, RECOVERED_MARKER + CONTENT]
-    _replay_twice_and_assert_noop(tmp_path, oid, expected)
+    _replay_twice_and_assert_noop(tmp_path, oid, expected, receiver_mode)
     assert len(expected) == 2  # explicit counterexample: two durable effects, second visibly marked
 
 
-def test_delivered_control_never_replays_after_abrupt_child_exit(tmp_path: Path):
-    _run_child(tmp_path, "seed-delivered", 137)
+def test_delivered_control_never_replays_after_abrupt_child_exit(
+    tmp_path: Path, receiver_mode: str
+):
+    _run_child(tmp_path, "seed-delivered", 137, receiver_mode)
     ids = _ids(tmp_path)
     oid = ids["obligation_id"]
     assert ids["scenario"] == "delivered-control"
@@ -363,7 +405,7 @@ def test_delivered_control_never_replays_after_abrupt_child_exit(tmp_path: Path)
     before = _ledger(tmp_path)
     assert before == {oid: ("delivered", 0)}
     for _ in range(2):
-        stdout, _ = _run_child(tmp_path, "replay", 0)
+        stdout, _ = _run_child(tmp_path, "replay", 0, receiver_mode)
         assert _result(stdout) == {"claimed": [], "delivered": 0}
     assert _journal(tmp_path) == [CONTENT]
     assert _ledger(tmp_path) == before
