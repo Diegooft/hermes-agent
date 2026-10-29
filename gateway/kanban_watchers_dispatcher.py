@@ -135,7 +135,8 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
 
     def _board_slugs(self) -> list:
-        return _board_slugs(self.kb)
+        from hermes_cli.kanban_dispatch_scope import dispatch_board_allowed
+        return [slug for slug in _board_slugs(self.kb) if dispatch_board_allowed(slug)]
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         path = self.kb.kanban_db_path(slug)

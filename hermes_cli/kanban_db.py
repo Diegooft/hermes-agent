@@ -2126,8 +2126,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
     for key in ("resume_status", "retry_status", "source_status"):
-        if payload.get(key) == "review":
-            return "review"
+        if payload.get(key) in {"review", "triage"}:
+            return payload[key]
     return "ready"
 
 
@@ -3647,11 +3647,15 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, expected_event_id: Optional[int] = None) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
+        if expected_event_id is not None:
+            latest = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
+            if latest != expected_event_id:
+                return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3664,8 +3668,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
         new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
+            resume_status
+            if landing_status == "ready" and resume_status in {"review", "triage"}
             else landing_status
         )
         # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
