@@ -927,6 +927,33 @@ class PluginContext:
         logger.debug("Plugin %s registered %d redaction pattern(s)", self.manifest.name, count)
         return count
 
+    def register_kanban_dispatch_guard(self, name: str, callback: Callable) -> PluginRegistration:
+        """Register a required-by-config, owner-namespaced claim/spawn verifier.
+
+        Callback receives immutable task/phase/board/profile_home. Only literal True
+        permits dispatch. Registration alone grants no authority or board access.
+        """
+        from hermes_cli.kanban_dispatch_guards import _NAME
+        key = f"{self.plugin_id}:{name}"
+        if not isinstance(name, str) or not _NAME.fullmatch(key):
+            raise ValueError("invalid kanban dispatch guard name")
+        if not callable(callback):
+            raise TypeError("kanban dispatch guard must be callable")
+        if key in self._manager._kanban_dispatch_guards:
+            raise ValueError("kanban dispatch guard already registered")
+        # Stable wrapper identity preserves the bounded callback's abandoned-worker
+        # suppression. Catch only exceptions originating inside the plugin worker;
+        # a real caller-thread Ctrl-C must still interrupt the dispatcher.
+        def guarded_callback(**payload):
+            try:
+                return self._manager._invoke_hook_callback(callback, payload)
+            except BaseException:
+                raise RuntimeError("kanban dispatch guard callback failed") from None
+        return self._register_entry(
+            "kanban_dispatch_guard", key, self._manager._kanban_dispatch_guards, guarded_callback,
+            "Plugin %s registered kanban dispatch guard: %s", key,
+        )
+
     def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
@@ -1215,6 +1242,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._portable_mcp_server_plugins: Dict[str, str] = {}
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
         self._approval_transports: Dict[str, Any] = {}
+        self._kanban_dispatch_guards: Dict[str, Callable] = {}
         self._slack_action_handlers: List[tuple] = []
         self._platform_handler_factories: Dict[str, List[tuple]] = {}
         # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().

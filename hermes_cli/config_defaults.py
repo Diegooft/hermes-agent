@@ -1913,6 +1913,9 @@ DEFAULT_CONFIG = {
         "dispatch_profiles": None,
         # User-layer presence matters: absent allows all, []/null denies all.
         "dispatch_boards": None,
+        # Mandatory plugin-id:name authorization checks before claim and spawn.
+        # Empty preserves legacy; configured missing/error/timeout guards deny.
+        "dispatch_guards": [],
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

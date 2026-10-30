@@ -120,6 +120,8 @@ class DispatchResult:
     """Unassigned task ids that had ``kanban.default_assignee`` applied this
     tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
     acting on the fallback rule rather than explicit assignments."""
+    authorization_denied: list[tuple[str, str, str]] = field(default_factory=list)
+    """(task_id, phase, sanitized reason); policy waits do not spend worker retries."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -171,6 +173,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             continue
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
+        if res.authorization_denied:
+            counts["authorization_denied"] = counts.get("authorization_denied", 0) + len(res.authorization_denied)
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
@@ -1456,7 +1460,9 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *,
+                    expected_run_id: Optional[int] = None,
+                    expected_claim_lock: Optional[str] = None) -> bool:
     """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
     emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
     decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
@@ -1464,13 +1470,22 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     whose bare-PID kill authority a new spawn must not inherit."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                     (int(pid), started_at, task_id))
+        if expected_run_id is not None or expected_claim_lock is not None:
+            updated = conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ? "
+                "AND status = 'running' AND current_run_id = ? AND claim_lock = ?",
+                (int(pid), started_at, task_id, expected_run_id, expected_claim_lock))
+            if updated.rowcount != 1:
+                return False
+        else:  # compatibility for existing direct callers
+            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                         (int(pid), started_at, task_id))
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, run_id))
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+        return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1993,6 +2008,32 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _record_authorization_denial(conn, task, result, phase, *, dry_run=False, reason="GUARD_REFUSED_OR_UNAVAILABLE"):
+    """One durable notice per task/phase/reason per minute; no private callback text."""
+    result.authorization_denied.append((task.id, phase, reason))
+    if dry_run:
+        return
+    import json
+    import time
+    payload = {"phase": phase, "reason": reason}
+    with _kb.write_txn(conn):
+        previous = conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'dispatch_authorization_denied' ORDER BY id DESC LIMIT 1", (task.id,),
+        ).fetchone()
+        if previous and json.loads(previous["payload"]) == payload and time.time() - previous["created_at"] < 60:
+            return
+        _kb._append_event(conn, task.id, "dispatch_authorization_denied", payload, run_id=task.current_run_id)
+
+
+def _block_authorization_wait(conn, task, result, reason):
+    _record_authorization_denial(conn, task, result, "spawn", reason=reason)
+    if _kb.block_task(conn, task.id, kind="capability",
+            reason="DISPATCH_AUTHORIZATION: " + reason,
+            expected_run_id=task.current_run_id, expected_claim_lock=task.claim_lock):
+        result.auto_blocked.append(task.id)
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2014,8 +2055,13 @@ def _dispatch_lane_task(
     """
     task_id = row["id"]
     from hermes_cli.kanban_dispatch_scope import dispatch_task_route_allowed
-    if not dispatch_task_route_allowed(_kb.get_task(conn,task_id)):
+    from hermes_cli.kanban_dispatch_guards import dispatch_guards_allowed
+    candidate = _kb.get_task(conn, task_id)
+    if not dispatch_task_route_allowed(candidate):
         result.skipped_nonspawnable.append(task_id)
+        return False
+    if not dispatch_guards_allowed(candidate, phase="claim", board=board):
+        _record_authorization_denial(conn, candidate, result, "claim", dry_run=dry_run)
         return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
@@ -2062,9 +2108,7 @@ def _dispatch_lane_task(
     if claimed is None:
         return False
     if not dispatch_task_route_allowed(claimed):
-        _record_task_failure(conn,claimed.id,"task route changed during dispatch",
-            outcome="spawn_failed",failure_limit=1,release_claim=True,end_run=True)
-        result.auto_blocked.append(claimed.id)
+        _block_authorization_wait(conn, claimed, result, "ROUTE_CHANGED")
         return False
     try:
         resolved_branch_name = None
@@ -2083,14 +2127,50 @@ def _dispatch_lane_task(
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    # Workspace preparation may take time: use fresh task data and live policy
+    # immediately before spawn. Never release a claim now owned by another run.
+    fresh = _kb.get_task(conn, claimed.id)
+    if (fresh is None or fresh.status != "running"
+            or fresh.claim_lock != claimed.claim_lock
+            or fresh.current_run_id != claimed.current_run_id):
+        result.skipped_nonspawnable.append(claimed.id)
+        return False
+    from hermes_cli.kanban_dispatch_scope import dispatch_board_allowed
+    live_profile_exists = _profile_exists_fn()
+    allowed = (fresh.assignee == claimed.assignee and dispatch_board_allowed(board)
+               and (live_profile_exists is None or live_profile_exists(fresh.assignee))
+               and dispatch_task_route_allowed(fresh)
+               and dispatch_guards_allowed(fresh, phase="spawn", board=board))
+    # A verifier can be slow. Do not spawn the snapshot it just checked if a
+    # concurrent writer changed the card while it ran. Refusal is claim-CASed.
+    if not allowed or _kb.get_task(conn, claimed.id) != fresh:
+        _block_authorization_wait(conn, claimed, result, "POLICY_OR_CONTRACT_CHANGED")
+        return False
+    from hermes_cli.kanban_launch_authorization import record_launch_authorization
+    try:
+        recorded = record_launch_authorization(conn, fresh, board=board)
+    except (Exception, SystemExit):
+        recorded = False
+    if not recorded:
+        _block_authorization_wait(conn, claimed, result, "LAUNCH_BINDING_UNAVAILABLE")
+        return False
+    claimed = fresh
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+        if pid and not _set_worker_pid(conn, claimed.id, int(pid),
+                expected_run_id=claimed.current_run_id, expected_claim_lock=claimed.claim_lock):
+            result.skipped_nonspawnable.append(claimed.id)
+            return False
+        current = _kb.get_task(conn, claimed.id)
+        if (current is None or current.status != "running"
+                or current.current_run_id != claimed.current_run_id
+                or current.claim_lock != claimed.claim_lock):
+            result.skipped_nonspawnable.append(claimed.id)
+            return False
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2364,9 +2444,9 @@ def _dispatch_once_locked(
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
-    for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
-            break
+    attempted_ready = set()
+    def dispatch_ready(row):
+        attempted_ready.add(row["id"])
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
@@ -2375,10 +2455,15 @@ def _dispatch_once_locked(
                 conn, row["id"], default_assignee, dry_run=dry_run,
             ):
                 result.skipped_unassigned.append(row["id"])
-                continue
+                return False
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+        return _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs)
+
+    for row in ready_rows:
+        if ready_budget is not None and spawned >= ready_budget:
+            break
+        if dispatch_ready(row):
             spawned += 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
@@ -2392,6 +2477,11 @@ def _dispatch_once_locked(
             result.skipped_unassigned.append(row["id"])
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+            spawned += 1
+    for row in ready_rows:
+        if spawn_budget is not None and spawned >= spawn_budget:
+            break
+        if row["id"] not in attempted_ready and dispatch_ready(row):
             spawned += 1
     return result
 

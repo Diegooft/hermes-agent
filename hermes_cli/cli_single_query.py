@@ -433,6 +433,13 @@ def _configure_quiet_agent(agent) -> None:
 def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool = False):
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit.
     ``stream_json`` (implies quiet) swaps the plain-text final answer for the JSONL event protocol."""
+    from hermes_cli.kanban_launch_authorization import worker_launch_allowed, record_worker_authorization_wait
+    def require_launch_authorization():
+        if not worker_launch_allowed():
+            record_worker_authorization_wait()
+            logger.warning("Kanban launch authorization refused before first turn")
+            raise SystemExit(78)
+    require_launch_authorization()  # refuse before credentials or agent initialization
     from cli import _SeededQueryMessage, _collect_kanban_task_images, _collect_query_images, _configure_quiet_agent, _finalize_single_query, _route_single_query_images, _run_kanban_goal_loop_chat, _run_quiet_single_query, _should_seed_interactive, _single_query_exit_code
     if _should_seed_interactive(query, image, quiet, oneshot):
         seeded_query, seeded_images = _collect_query_images(query, image)
@@ -441,6 +448,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             len(seeded_query or ""), len(seeded_images),
         )
         cli._seeded_first_message = _SeededQueryMessage(seeded_query, seeded_images)
+        require_launch_authorization()
         return cli.run()
     cli._single_query_mode = True  # agent waits the full MCP cold-start before its only tool snapshot
     # Only the interactive run loop set this, so plugin tools dispatched from a `-q`/`-Q` turn got no
@@ -486,6 +494,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
                     _configure_quiet_agent(cli.agent)
                     if emitter is not None:
                         emitter.attach(cli.agent)
+                    require_launch_authorization()
                     _run_quiet_single_query(cli, effective_query, emitter=emitter)
 
             fail_code = _single_query_exit_code(
@@ -499,6 +508,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         if _query_label:
             cli.console.print(f"[bold blue]Query:[/] {_query_label}")
         cli._show_security_advisories()
+        require_launch_authorization()
         response = cli.chat(query, images=single_query_images or None)
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher

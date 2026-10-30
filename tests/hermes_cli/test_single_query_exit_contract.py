@@ -107,3 +107,10 @@ def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(mo
     with pytest.raises(SystemExit) as exc:
         cli._run_single_query_mode(stub, "do the thing", None, True, True)
     assert exc.value.code == expected
+
+
+@pytest.fixture(autouse=True)
+def _authorize_stub_worker_launch(monkeypatch):
+    # These tests stub the worker/model to isolate exit-code semantics. Real
+    # claim/config/receipt validation is exercised in test_kanban_launch_authorization.
+    monkeypatch.setattr('hermes_cli.kanban_launch_authorization.worker_launch_allowed', lambda: True)
