@@ -106,6 +106,32 @@ class TestGitTrampolineSelfHeal:
         assert result == git_cmd
         run.assert_not_called()
 
+    @pytest.mark.parametrize("probe_result", [False, True, None])
+    def test_locate_real_git_supports_ucrt_layout(self, tmp_path, monkeypatch, probe_result):
+        # Git for Windows 2.56 replaced mingw64 with ucrt64. Exercise the
+        # real locator against a filesystem containing only the new layout.
+        from hermes_cli import update_cmd_git
+
+        real = tmp_path / "program-files" / "Git" / "ucrt64" / "libexec" / "git-core" / "git.exe"
+        real.parent.mkdir(parents=True)
+        real.touch()
+        monkeypatch.setattr(
+            update_cmd_git, "Path",
+            lambda value: tmp_path / ("program-files-x86" if "(x86)" in value else "program-files"),
+        )
+        monkeypatch.setattr(update_cmd_git, "_portable_git_candidates", lambda: [])
+        probes = []
+
+        def probe(argv):
+            probes.append(argv)
+            return probe_result
+
+        monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", probe)
+        result = update_cmd_git._locate_real_git()
+
+        assert probes == [[str(real)]]
+        assert result == (real if probe_result is False else None)
+
     def test_portable_git_candidates_check_shared_root_first(self, tmp_path, monkeypatch):
         # Profile-scoped layout: HERMES_HOME = <root>/profiles/foo, but the
         # PortableGit tree lives under the SHARED root (monerostar review on
