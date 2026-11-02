@@ -38,7 +38,58 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
     return value
 
 
-def collect_acceptance(contract: str, published_pr: str | None) -> dict:
+def _absorbed(repo: str, number: int, source_sha: str, integration_pr: str, source_pr: dict) -> dict:
+    """Corroborate a closed source with a landed same-repo staging vehicle."""
+    vehicle = collect_acceptance("github_pr", integration_pr)
+    if not vehicle["ok"]:
+        return {"ok": False, "classification": vehicle["classification"], "integration": vehicle}
+    vehicle_number = int(_PR.fullmatch(integration_pr)[2])
+    vehicle_pr = _api(f"repos/{repo}/pulls/{vehicle_number}")
+    landing = vehicle_pr.get("merge_commit_sha")
+    if (not re.fullmatch(r"[0-9a-f]{40}", landing or "") or
+        vehicle_pr["head"]["sha"] != vehicle["head_sha"] or
+        not vehicle_pr["head"]["ref"].startswith("integra/trem-") or
+        vehicle_pr["head"]["repo"]["full_name"] != repo or
+        vehicle_pr["base"]["ref"] != "staging" or
+        vehicle_pr["state"] != "closed" or vehicle_pr.get("merged") is not True):
+        raise ValueError("Integration landing identity unavailable")
+    details = _api(f"repos/{repo}/pulls/{number}")
+    if (details["head"]["sha"] != source_sha or details["base"]["ref"] != "staging" or
+        details["state"] != "closed" or details.get("merged") is not False or
+        details["head"]["ref"] != source_pr["head"]["ref"] or
+        details["head"]["repo"]["full_name"] != repo):
+        raise ValueError("Source publication changed")
+    pages = _api(f"repos/{repo}/pulls/{number}/files?per_page=100", paginate=True)
+    files = [item for page in pages for item in page]
+    if (not files or len(files) != details["changed_files"] or len(files) > 3000 or
+        len({f["filename"] for f in files}) != len(files)):
+        raise ValueError("Incomplete source changed-file pagination")
+    def tree(sha):
+        result = _api(f"repos/{repo}/git/trees/{sha}?recursive=1")
+        if result.get("truncated") is not False:
+            raise ValueError("Incomplete tree")
+        return {entry["path"]: (entry["mode"], entry["type"], entry["sha"]) for entry in result["tree"]}
+    source, head, landed = (tree(sha) for sha in (source_sha, vehicle["head_sha"], landing))
+    for item in files:
+        path = item["filename"]
+        blob = source.get(path)
+        if item["status"] == "removed":
+            if any(path in target for target in (source, head, landed)):
+                raise ValueError("Deleted source file not preserved")
+        elif (item["status"] == "renamed" and
+              (not item.get("previous_filename") or any(item["previous_filename"] in target for target in (source, head, landed)))):
+            raise ValueError("Renamed source old path is still present")
+        elif (not blob or blob[1:] != ("blob", item["sha"]) or head.get(path) != blob or landed.get(path) != blob):
+            raise ValueError("Source blob missing from vehicle or landing")
+    staging = _api(f"repos/{repo}/branches/staging")["commit"]["sha"]
+    ancestry = _api(f"repos/{repo}/compare/{landing}...{staging}")
+    if ancestry["status"] not in {"ahead", "identical"}:
+        raise ValueError("Landing not ancestral to current staging")
+    return {"ok": True, "classification": "success", "integration": vehicle,
+            "integration_branch": vehicle_pr["head"]["ref"],
+            "landing_sha": landing, "staging_sha": staging, "files": len(files)}
+
+def collect_acceptance(contract: str, published_pr: str | None, *, integration_pr: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
                "pr_url": published_pr, "checks": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
@@ -60,15 +111,18 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
-        if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
+        if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in ({"OPEN", "MERGED", "CLOSED"} if delivery and integration_pr else {"OPEN", "MERGED"}):
             raise ValueError("PR is closed or current head is unavailable")
         if delivery:
             receipt.update(base_branch=branch, pr_state=pr["state"], completion_contract="github_pr")
             if branch != "staging":
                 receipt.update(classification="failure", detail="github_pr delivery requires base staging.")
                 return receipt
-            if pr["state"] != "MERGED":
+            if pr["state"] != "MERGED" and not (integration_pr and pr["state"] == "CLOSED"):
                 receipt.update(classification="pending", detail="Delivery published; waiting for the PR to be merged into staging.")
+                return receipt
+            if integration_pr and (not _PR.fullmatch(integration_pr) or _PR.fullmatch(integration_pr)[1] != repo or integration_pr == url):
+                receipt.update(classification="failure", detail="Integration PR must differ and belong to the same repository.")
                 return receipt
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
@@ -91,6 +145,14 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
+            # GitHub's filter=latest can retain attempts from separate workflow
+            # runs. Compare recency within an app, never choose by conclusion.
+            newest = {}
+            for run in matching:
+                owner = run["app"]["id"]
+                if owner not in newest or run["id"] > newest[owner]["id"]:
+                    newest[owner] = run
+            matching = list(newest.values())
             # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
             legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
             selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
@@ -108,18 +170,33 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                     "classification": classification, "conclusion": outcome})
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}")
-        if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
+        if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged") and not integration_pr):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
-        if delivery and (current["base"]["ref"] != "staging" or current["state"] != "closed" or current.get("merged") is not True):
+        if delivery and (current["base"]["ref"] != "staging" or current["state"] != "closed" or (current.get("merged") is not True and not integration_pr)):
             receipt.update(classification="stale", detail="Merged staging delivery could not be confirmed on the final PR read.")
             return receipt
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
+        if delivery and integration_pr and current.get("merged") is False and receipt["ok"]:
+            absorbed = _absorbed(repo, number, sha, integration_pr, current)
+            receipt.update(absorbed)
+            receipt["integration_pr"] = integration_pr
+            final = _api(f"repos/{repo}/pulls/{number}")
+            final_vehicle = _api(f"repos/{repo}/pulls/{int(_PR.fullmatch(integration_pr)[2])}")
+            if (final["head"]["sha"] != sha or final["head"]["ref"] != current["head"]["ref"] or
+                final["head"]["repo"]["full_name"] != repo or
+                final["base"]["ref"] != branch or final["state"] != "closed" or final.get("merged") is not False or
+                final_vehicle["head"]["sha"] != absorbed["integration"]["head_sha"] or
+                final_vehicle["head"]["ref"] != absorbed["integration_branch"] or
+                final_vehicle["head"]["repo"]["full_name"] != repo or
+                final_vehicle["base"]["ref"] != "staging" or final_vehicle["state"] != "closed" or
+                final_vehicle.get("merged") is not True or final_vehicle.get("merge_commit_sha") != absorbed["landing_sha"]):
+                receipt.update(ok=False, classification="stale", detail="Publication changed during absorption evidence collection.")
         return receipt
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
-        receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
+        receipt.update(ok=False, classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt
 
 

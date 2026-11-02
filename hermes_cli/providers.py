@@ -53,6 +53,10 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
                                    base_url_override="https://api.minimax.io/anthropic"),
     "minimax-cn": HermesOverlay(transport="anthropic_messages", base_url_env_var="MINIMAX_CN_BASE_URL"),
     "deepseek": HermesOverlay(base_url_env_var="DEEPSEEK_BASE_URL"),
+    # Preserve the bundled profile's credentials when models.dev also lists it.
+    "commandcode": HermesOverlay(extra_env_vars=("COMMANDCODE_API_KEY",),
+                                  base_url_override="https://api.commandcode.ai/provider/v1",
+                                  base_url_env_var="COMMANDCODE_BASE_URL"),
     "alibaba": HermesOverlay(base_url_env_var="DASHSCOPE_BASE_URL"),
     "alibaba-coding-plan": HermesOverlay(base_url_env_var="ALIBABA_CODING_PLAN_BASE_URL"),
     "vercel": HermesOverlay(is_aggregator=True),
@@ -143,6 +147,7 @@ ALIASES: Dict[str, str] = {alias: canon for canon, aliases in _ALIAS_GROUPS.item
 
 _LABEL_OVERRIDES: Dict[str, str] = {
     "moa": "Mixture of Agents", "nous": "Nous Portal", "openai-codex": "ChatGPT or Codex Subscription",
+    "commandcode": "CommandCode",
     "copilot-acp": "GitHub Copilot ACP", "stepfun": "StepFun Step Plan", "xiaomi": "Xiaomi MiMo", "gmi": "GMI Cloud",
     "upstage": "Upstage Solar", "actual": "Actual Computer", "tencent-tokenhub": "Tencent TokenHub",
     "nebius-token-factory": "Nebius Token Factory", "tencent-tokenplan": "Tencent TokenPlan", "lmstudio": "LM Studio",

@@ -1939,6 +1939,11 @@ def dispatch_once(
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
+    from hermes_cli.kanban_dispatch_scope import dispatch_board_allowed
+    if not dispatch_board_allowed(board):
+        return DispatchResult(skipped_nonspawnable=[row[0] for row in conn.execute(
+            "SELECT id FROM tasks WHERE status IN ('ready', 'review') ORDER BY id")])
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -2008,6 +2013,10 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    from hermes_cli.kanban_dispatch_scope import dispatch_task_route_allowed
+    if not dispatch_task_route_allowed(_kb.get_task(conn,task_id)):
+        result.skipped_nonspawnable.append(task_id)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2051,6 +2060,11 @@ def _dispatch_lane_task(
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
+        return False
+    if not dispatch_task_route_allowed(claimed):
+        _record_task_failure(conn,claimed.id,"task route changed during dispatch",
+            outcome="spawn_failed",failure_limit=1,release_claim=True,end_run=True)
+        result.auto_blocked.append(claimed.id)
         return False
     try:
         resolved_branch_name = None

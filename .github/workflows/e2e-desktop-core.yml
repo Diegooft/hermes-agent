@@ -21,11 +21,13 @@ concurrency:
   group: e2e-desktop-core-${{ github.ref }}
   cancel-in-progress: true
 
+# This fork branch uses standard hosted runners with bounded parallelism.
+# This is a scheduling adaptation; full-suite timing still requires measurement.
 jobs:
   core:
     name: Desktop core E2E (Linux)
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'Diegooft/hermes-agent' && github.ref == 'refs/heads/fix/growth-autonomy-20261029' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: ${{ github.repository == 'Diegooft/hermes-agent' && github.ref == 'refs/heads/fix/growth-autonomy-20261029' && 120 || 30 }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
