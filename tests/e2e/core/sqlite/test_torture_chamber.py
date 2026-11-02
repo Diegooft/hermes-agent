@@ -32,6 +32,7 @@ Randomness (ack thresholds, kill points) is seeded per episode; the seed is in e
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import random
 import sqlite3
@@ -376,6 +377,15 @@ def test_torture_episode(chamber, episode):
     problems += _reader_fd_problems(chamber)
     problems += _churn_fd_problems(chamber, episode)
     busy = busy_summary(chamber, episode)
+    if not chamber._monitor.is_alive():
+        problems.append("deleted-FD invariant monitor stopped unexpectedly")
+    if not chamber._detail_worker.is_alive() or chamber._detail_errors:
+        problems.append(f"deleted-FD diagnostic worker unhealthy: {chamber._detail_errors}")
+    if problems and chamber.deleted_hits_snapshot():
+        problems.append("deleted-fd kernel context (non-atomic, not a classification): "
+                        + json.dumps({"events": chamber.deleted_fd_details_snapshot(),
+                                      "pending": chamber._detail_queue.unfinished_tasks,
+                                      "asynchronous_non_atomic": True}, sort_keys=True))
     assert not problems, f"{ctx} ({time.monotonic() - started:.1f}s, busy waits {busy})\n" + "\n".join(problems)
 
 

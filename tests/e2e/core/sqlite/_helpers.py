@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import random
 import signal
 import sqlite3
@@ -86,6 +87,36 @@ def child_env(home: Path, hermes_home: Path) -> dict:
     return env
 
 
+def _deleted_fd_observation(pid: int, fd: str, link: str) -> dict:
+    """Best-effort, non-atomic kernel context; never classifies or suppresses a hit."""
+    root = Path(f"/proc/{pid}")
+    path = root / "fd" / fd
+
+    def identity(target):
+        stat = target.stat()
+        return {"dev": stat.st_dev, "ino": stat.st_ino, "nlink": stat.st_nlink}
+
+    readers = {
+        "fd_stat_before": lambda: identity(path),
+        "fdinfo": lambda: (root / "fdinfo" / fd).read_text()[:4096],
+        "syscall": lambda: (root / "syscall").read_text()[:512],
+        "wchan": lambda: (root / "wchan").read_text()[:256],
+        "link": lambda: os.readlink(path),
+        "path_stat": lambda: identity(Path(link.removesuffix(" (deleted)"))),
+        "fd_stat_after": lambda: identity(path),
+    }
+    result = {"monotonic_ns": time.monotonic_ns(), "non_atomic": True}
+    for key, read in readers.items():
+        try:
+            result[key] = read()
+        except Exception as error:
+            result[key] = {"error": type(error).__name__, "errno": getattr(error, "errno", None)}
+    before, after = result["fd_stat_before"], result["fd_stat_after"]
+    result["fd_identity_stable"] = ("ino" in before and "ino" in after
+                                      and (before["dev"], before["ino"]) == (after["dev"], after["ino"]))
+    return result
+
+
 class Chamber:
     """A private HERMES_HOME + state.db plus the processes playing roles against it."""
 
@@ -110,10 +141,17 @@ class Chamber:
         self.reader_seq = 0
         self.reader_name: str | None = None
         self.deleted_hits: list[tuple[str, int, str]] = []
+        self.deleted_fd_details: list[dict] = []
+        self._detail_queue = queue.Queue(maxsize=32)
+        self._detail_keys: set[tuple[str, int, str]] = set()
+        self._detail_errors: list[str] = []
         self.fd_samples: dict[str, list[int]] = {}
         self._lock = threading.Lock()
         self._monitor_stop = threading.Event()
+        self._detail_stop = threading.Event()
         self._monitor = threading.Thread(target=self._scan_loop, name="deleted-fd-monitor", daemon=True)
+        self._detail_worker = threading.Thread(target=self._detail_loop, name="deleted-fd-details", daemon=True)
+        self._detail_worker.start()
         self._monitor.start()
 
     # -- lifecycle ---------------------------------------------------------------------------------
@@ -219,6 +257,13 @@ class Chamber:
                 f.close()
         self._monitor_stop.set()
         self._monitor.join(timeout=5)
+        assert not self._monitor.is_alive(), "deleted-FD invariant monitor failed to stop"
+        # The producer has stopped: no task can be enqueued after this consumer signal.
+        self._detail_stop.set()
+        self._detail_worker.join(timeout=5)
+        assert not self._detail_worker.is_alive(), "deleted-FD diagnostic worker failed to stop"
+        assert self._detail_queue.unfinished_tasks == 0, "deleted-FD diagnostic tasks were not drained"
+        assert not self._detail_errors, f"deleted-FD diagnostic errors: {self._detail_errors}"
 
     # -- kernel truth: (deleted) sidecars held by our children --------------------------------------
     def _scan_loop(self) -> None:
@@ -240,11 +285,54 @@ class Chamber:
                     if link.endswith(" (deleted)") and link[: -len(" (deleted)")] in targets:
                         with self._lock:
                             self.deleted_hits.append((name, proc.pid, link))
+                            key = (name, proc.pid, fd)
+                            if len(self._detail_keys) < 32 and key not in self._detail_keys:
+                                self._detail_keys.add(key)
+                                # At most 32 tasks ever: no proc metadata IO or waiting in the scanner.
+                                self._detail_queue.put_nowait((name, proc, fd, link, time.monotonic_ns()))
             self._monitor_stop.wait(0.02)
+
+    def _detail_loop(self) -> None:
+        while True:
+            try:
+                name, proc, fd, link, seen_ns = self._detail_queue.get(timeout=0.02)
+            except queue.Empty:
+                if self._detail_stop.is_set():
+                    return
+                continue
+            try:
+                rc = proc.poll()
+                observed = (_deleted_fd_observation(proc.pid, fd, link) if rc is None
+                            else {"unavailable": "owned child already exited"})
+                event = {"name": name, "pid": proc.pid, "fd": fd, "observed_link": link,
+                         "scan_monotonic_ns": seen_ns, "observed": observed,
+                         "returncode_at_observation": rc}
+                with self._lock:
+                    self.deleted_fd_details.append(event)
+            except Exception as error:
+                # Diagnostic failure cannot terminate the invariant scanner or be silent.
+                with self._lock:
+                    self._detail_errors.append(type(error).__name__)
+            finally:
+                self._detail_queue.task_done()
 
     def deleted_hits_snapshot(self) -> list[tuple[str, int, str]]:
         with self._lock:
             return sorted(set(self.deleted_hits))
+
+    def deleted_fd_details_snapshot(self) -> list[dict]:
+        with self._lock:
+            events = [dict(e) for e in self.deleted_fd_details]
+        for event in events:
+            proc = self.procs[event["name"]]
+            event["returncode_at_snapshot"] = proc.poll()
+            if event["returncode_at_snapshot"] is None:
+                event["followup"] = _deleted_fd_observation(event["pid"], event["fd"], event["observed_link"])
+                before = event["observed"].get("fd_stat_before", {})
+                after = event["followup"].get("fd_stat_before", {})
+                event["same_fd_as_observation"] = ("ino" in before and "ino" in after
+                    and (before["dev"], before["ino"]) == (after["dev"], after["ino"]))
+        return events
 
     # -- reports -------------------------------------------------------------------------------------
     def events(self, name: str) -> list[dict]:
