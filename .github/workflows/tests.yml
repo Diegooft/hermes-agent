@@ -27,7 +27,8 @@ jobs:
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
     runs-on: ${{ github.repository == 'Diegooft/hermes-agent' && github.ref == 'refs/heads/fix/growth-autonomy-20261029' && 'ubuntu-latest' || 'ubuntu-latest-96-core' }}
-    timeout-minutes: ${{ github.repository == 'Diegooft/hermes-agent' && github.ref == 'refs/heads/fix/growth-autonomy-20261029' && 120 || 30 }}
+    # Measured fork run reached 95.5% at the 120m job cap; retain per-file deadlines.
+    timeout-minutes: ${{ github.repository == 'Diegooft/hermes-agent' && github.ref == 'refs/heads/fix/growth-autonomy-20261029' && 180 || 30 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -186,7 +187,11 @@ jobs:
         # tests/e2e/core/upgrade runs in its own job (e2e-upgrade) below.
         run: |
           mapfile -t files < <(find tests/e2e -name 'test_*.py' -not -path 'tests/e2e/core/upgrade/*' | sort)
-          scripts/run_tests.sh --include-integration "${files[@]}"
+          diagnostics=()
+          if [[ "$GITHUB_REPOSITORY" == "Diegooft/hermes-agent" && "$GITHUB_REF" == "refs/heads/fix/growth-autonomy-20261029" ]]; then
+            diagnostics=(-- -vv -o faulthandler_timeout=120)
+          fi
+          scripts/run_tests.sh --include-integration "${files[@]}" "${diagnostics[@]}"
         env:
           # An e2e file is a process tree, not one CPU-bound pytest worker. With
           # 32 files at once the hosted run starved live children before their

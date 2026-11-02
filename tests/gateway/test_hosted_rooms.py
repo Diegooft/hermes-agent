@@ -722,7 +722,8 @@ def test_disband_rejects_stale_authority(tmp_path):
 def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     _create(db)
-    for index in range(4):
+    # Serialized float widths vary; replay must not depend on wall-clock precision.
+    for index, now in enumerate((20.0, 20.123456789, 21.0, 21.123456789)):
         _append(
             db,
             room_id="room-1",
@@ -730,13 +731,18 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
             kind="message.user",
             actor=USER,
             payload={"text": "x" * 180, "index": index},
+            now=now,
         )
 
-    one_event = rooms.read_events(db, room_id="room-1", limit=1)
-    budget = len(
-        json.dumps(one_event, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+    # Every single-event page must fit, including varying timestamp precision
+    # and cursor/has_more overhead; the first page alone is not an upper bound.
+    single_pages = [
+        rooms.read_events(db, room_id="room-1", since_seq=index, limit=1)
+        for index in range(4)
+    ]
+    budget = max(
+        len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        for page in single_pages
     ) + 1
     monkeypatch.setattr(rooms, "MAX_LOG_PAGE_BYTES", budget)
 
@@ -750,6 +756,10 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
         limit=4,
     )
     assert second["events"][0]["seq"] == first["cursor"] + 1
+    for page in (first, second):
+        assert len(
+            json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ) <= budget
 
 
 
